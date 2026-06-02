@@ -1,0 +1,1593 @@
+;;; org-tracked-docx.el --- Round-trip Word docx with track changes  -*- lexical-binding: t; -*-
+
+;; Author: drafted with Claude
+;; Keywords: org, pandoc, docx, track changes, CriticMarkup
+;; URL: project-local
+;; Package-Requires: ((emacs "27.1"))
+
+;;; Commentary:
+;;
+;; A tiny wrapper around `pandoc --track-changes=all' that imports a Word
+;; .docx into org-mode preserving tracked changes and comments as
+;; CriticMarkup.  The mode highlights insertions/deletions/substitutions and
+;; provides accept-/reject-all helpers.
+;;
+;; Workflow:
+;;   1. Author the manuscript in org (e.g. 2026-LGCM2.org).
+;;   2. Export to docx with `M-x org-pandoc-export-to-docx'.
+;;   3. Send the docx to a co-author.  They turn on Track Changes (Review
+;;      -> Track Changes in Word; Edit -> Track Changes -> Record in
+;;      LibreOffice), edit, and return the docx.
+;;   4. `M-x otd-import' on the returned docx.  The output buffer holds
+;;      the manuscript with `{++inserted++}', `{--deleted--}',
+;;      `{~~old~>new~~}', and `{>>comment<<}' markers, font-lock-coloured.
+;;   5. To merge: open the canonical .org and `M-x otd-diff-against' to
+;;      word-diff against the imported tracked file; or `M-x
+;;      otd-accept-all' / `otd-reject-all' to flatten the tracked file
+;;      and then diff or copy paragraphs across.
+;;
+;; CriticMarkup spec: <http://criticmarkup.com/spec.php>
+;; Pandoc track-changes docs:
+;;   <https://pandoc.org/MANUAL.html#option--track-changes>
+
+;;; Code:
+
+(require 'subr-x)
+(require 'ansi-color)
+
+(defgroup org-tracked-docx nil
+  "Import Word docx with tracked changes as CriticMarkup-decorated org."
+  :group 'org)
+
+(defcustom otd-pandoc-program "pandoc"
+  "Path to the pandoc executable."
+  :type 'string :group 'org-tracked-docx)
+
+(defcustom otd-extract-media-suffix "media"
+  "Suffix appended to docx basename for the extracted-media dir."
+  :type 'string :group 'org-tracked-docx)
+
+(defcustom otd-output-suffix "-tracked"
+  "Suffix appended to docx basename for the imported .org file."
+  :type 'string :group 'org-tracked-docx)
+
+(defcustom otd-export-author user-full-name
+  "Author name written into pandoc track-change spans on `otd-export'.
+Surfaces in Word as the reviewer who made each tracked edit/comment."
+  :type 'string :group 'org-tracked-docx)
+
+(defcustom otd-embed-source t
+  "When non-nil, `otd-export' embeds the source .org file inside the
+output .docx as a customXml part.  Word and LibreOffice preserve
+customXml across saves and tracked edits, so when the reviewed docx
+returns it still carries the canonical org text (with cite keys,
+metadata headers, etc.) which the docx body cannot represent.
+`otd-import' detects the part automatically and uses it for merge."
+  :type 'boolean :group 'org-tracked-docx)
+
+(defcustom otd-import-auto-merge t
+  "When non-nil and the imported docx carries an embedded org source
+\(see `otd-embed-source'), `otd-import' runs `otd--merge-content' to
+produce a merged file: canonical structure (cite keys, metadata)
+plus CriticMarkup tokens placed at matching paragraphs.
+
+When nil or no embedded source is present, the lossy pandoc roundtrip
+is used as-is."
+  :type 'boolean :group 'org-tracked-docx)
+
+;;;; --- import ----------------------------------------------------------
+
+;;;###autoload
+(defun otd-import (docx &optional output)
+  "Convert DOCX to org-mode preserving tracked changes AND comments as CriticMarkup.
+With prefix arg, prompt for OUTPUT path; otherwise the output is placed
+alongside DOCX with `otd-output-suffix' appended.  After conversion the
+output buffer is opened with `otd-criticmarkup-mode' enabled.
+
+Pipeline:
+  pandoc docx -> markdown (--track-changes=all preserves ins/del/comment as
+                           pandoc-attribute spans),
+  rewrite spans to CriticMarkup tokens,
+  pandoc markdown -> org (CriticMarkup tokens pass through as plain text)."
+  (interactive
+   (list (read-file-name "Docx file: " nil nil t nil
+                         (lambda (f) (or (file-directory-p f)
+                                         (string-match-p "\\.docx\\'" f))))
+         (when current-prefix-arg (read-file-name "Output .org: "))))
+  (unless (file-exists-p docx) (user-error "File not found: %s" docx))
+  (let* ((dir        (file-name-directory (expand-file-name docx)))
+         (base       (file-name-sans-extension (file-name-nondirectory docx)))
+         (out        (or output
+                         (expand-file-name (concat base otd-output-suffix ".org") dir)))
+         (media      (expand-file-name (concat base "-" otd-extract-media-suffix) dir))
+         (md-tmp     (make-temp-file "otd-" nil ".md"))
+         (docx-fixed (otd--preserve-leading-spaces (expand-file-name docx)))
+         (grid-alist nil))
+    (unwind-protect
+        (progn
+          ;; Stage 1: docx -> markdown with track-change/comment spans.
+          ;; (`docx-fixed' has leading-space cell content rewritten to NBSP
+          ;; so the indentation survives pandoc's docx AST parser.)
+          (with-temp-buffer
+            (let ((exit (apply #'call-process otd-pandoc-program nil t nil
+                               (list "-f" "docx" "-t" "markdown"
+                                     "--wrap=none"
+                                     "--track-changes=all"
+                                     (format "--extract-media=%s" media)
+                                     docx-fixed
+                                     "-o" md-tmp))))
+              (unless (zerop exit)
+                (error "pandoc docx->md exit %s:\n%s" exit (buffer-string)))))
+          ;; Stage 2: rewrite pandoc spans to CriticMarkup
+          (let ((counts (otd--rewrite-spans md-tmp)))
+            ;; Stage 2b: shield grid_tables (multi-line cells) with sentinels
+            ;; so pandoc's md->org cannot collapse them into pipe-table rows.
+            (setq grid-alist (otd--shield-grid-tables md-tmp))
+            ;; Stage 3: markdown (with CriticMarkup) -> org; tokens pass through
+            (with-temp-buffer
+              (let ((exit (apply #'call-process otd-pandoc-program nil t nil
+                                 (list "-f" "markdown" "-t" "org"
+                                       "--wrap=none" md-tmp "-o" out))))
+                (unless (zerop exit)
+                  (error "pandoc md->org exit %s:\n%s" exit (buffer-string)))))
+            ;; Stage 3b: restore shielded grid_tables as raw markdown blocks
+            ;; (`#+BEGIN_EXPORT markdown' survives the org->md->docx round-trip
+            ;; in `otd-export', so the multi-line cell structure is preserved).
+            (otd--restore-grid-tables out grid-alist)
+            ;; Stage 4: sanitize the org file so the next round-trip back
+            ;; to docx renders super/subscripts (see `otd--postfix-org').
+            (otd--postfix-org out)
+            ;; Stage 5: if the docx carries an embedded org source (sent
+            ;; out by an earlier `otd-export'), extract it and merge so
+            ;; the resulting tracked file keeps cite keys / metadata.
+            (let* ((embedded (otd--extract-org-source (expand-file-name docx)))
+                   merge-info)
+              (when embedded
+                (let ((src (expand-file-name (concat base "-source.org") dir)))
+                  (with-temp-file src (insert embedded))
+                  (when otd-import-auto-merge
+                    (let* ((tracked (with-temp-buffer
+                                      (insert-file-contents out)
+                                      (buffer-string)))
+                           (result (otd--merge-content embedded tracked)))
+                      (setq merge-info (cdr result))
+                      (with-temp-file out (insert (car result)))))))
+              (find-file out)
+              (otd-criticmarkup-mode 1)
+              (message
+               (concat "Imported %s -> %s  (++%d --%d ~~%d ==%d >>%d  grid:%d)"
+                       (when embedded
+                         (format "  source-found%s"
+                                 (if merge-info
+                                     (format ":merged %d/%d para, %d cite-keys%s"
+                                             (plist-get merge-info :merged-paragraphs)
+                                             (plist-get merge-info :cm-paragraphs)
+                                             (plist-get merge-info :cite-keys)
+                                             (let ((n (plist-get merge-info
+                                                                 :reanchored-comments)))
+                                               (if (and n (> n 0))
+                                                   (format ", %d cmt-grafted" n) "")))
+                                   ""))))
+               (file-name-nondirectory docx)
+               (file-name-nondirectory out)
+               (plist-get counts :ins) (plist-get counts :del)
+               (plist-get counts :sub) (plist-get counts :hi)
+               (plist-get counts :cmt) (length grid-alist)))))
+      (when (file-exists-p md-tmp)     (delete-file md-tmp))
+      (when (file-exists-p docx-fixed) (delete-file docx-fixed)))
+    out))
+
+(defun otd--rewrite-spans (md-file)
+  "Rewrite pandoc track-change/comment spans in MD-FILE to CriticMarkup.
+Return a plist with counts of each marker emitted."
+  (let ((n-ins 0) (n-del 0) (n-sub 0) (n-hi 0) (n-cmt 0))
+    (with-temp-buffer
+      (insert-file-contents md-file)
+      ;; Pre-pass: flatten pandoc's nested closing spans for overlapping
+      ;; reviewer comments.  For two comments on the same range pandoc emits
+      ;; `[[]{.comment-end id="INNER"}]{.comment-end id="OUTER"}'; this turns
+      ;; it into `[]{.comment-end id="INNER"}[]{.comment-end id="OUTER"}'
+      ;; (two adjacent simple closings), so the main pattern below matches
+      ;; both.  Loop to flatten arbitrary nesting depth.
+      (goto-char (point-min))
+      (let ((flat t))
+        (while flat
+          (setq flat nil)
+          (goto-char (point-min))
+          (while (re-search-forward
+                  "\\[\\(\\[\\]{\\.comment-end[[:space:]]+id=\"[0-9]+\"}\\)\\]\\({\\.comment-end[[:space:]]+id=\"[0-9]+\"}\\)"
+                  nil t)
+            (replace-match "\\1[]\\2" t)
+            (setq flat t))))
+      ;; Comments: [CTEXT]{.comment-start id="N"...}RANGE[]{.comment-end id="N"}
+      ;; -> {==RANGE==}{>>CTEXT<<}.  Rewrite innermost-first so an outer
+      ;; comment's lazy range cannot swallow an inner comment's spans (the
+      ;; common case where reviewers leave overlapping comments on the same
+      ;; paragraph).  Each iteration finds the comment-start whose matching
+      ;; comment-end is closest, replaces that pair, and re-scans.
+      (let ((more t))
+        (while more
+          (setq more nil)
+          (let ((best-dist most-positive-fixnum)
+                (best nil))
+            (save-excursion
+              (goto-char (point-min))
+              (while (re-search-forward
+                      "\\[\\([^]]*\\)\\]{\\.comment-start[[:space:]]+id=\"\\([0-9]+\\)\"\\([^}]*\\)}"
+                      nil t)
+                (let* ((ctext (match-string 1))
+                       (id    (match-string 2))
+                       (attrs (match-string 3))
+                       ;; Capture positions BEFORE string-match clobbers the
+                       ;; outer re-search-forward's match data.
+                       (start (match-beginning 0))
+                       (after (match-end 0))
+                       (author (and (string-match
+                                     "author=\"\\([^\"]*\\)\"" attrs)
+                                    (match-string 1 attrs))))
+                  (save-excursion
+                    (when (re-search-forward
+                           (concat "\\[\\]{\\.comment-end[[:space:]]+id=\""
+                                   id "\"}")
+                           nil t)
+                      (let ((dist (- (match-beginning 0) after)))
+                        (when (< dist best-dist)
+                          (setq best-dist dist
+                                best (list start (match-end 0)
+                                           ctext author after
+                                           (match-beginning 0))))))))))
+            (when best
+              (setq more t)
+              (let* ((start-pos   (nth 0 best))
+                     (end-pos     (nth 1 best))
+                     (ctext       (nth 2 best))
+                     (author      (nth 3 best))
+                     (range-start (nth 4 best))
+                     (range-end   (nth 5 best))
+                     (range-text  (buffer-substring-no-properties
+                                   range-start range-end))
+                     ;; Encode docx author into the CriticMarkup comment text as
+                     ;; `[Author Name] …' prefix, so `otd-export' can round-trip
+                     ;; authorship back into Word's `<w:comment w:author="…">'.
+                     (ctext-tagged (if (and author (not (string-empty-p author)))
+                                       (format "[%s] %s" author ctext)
+                                     ctext)))
+                (delete-region start-pos end-pos)
+                (goto-char start-pos)
+                (insert (format "{==%s==}{>>%s<<}" range-text ctext-tagged))
+                (cl-incf n-hi) (cl-incf n-cmt))))))
+      ;; Paragraph-level insertions/deletions (inserted/deleted whole paragraphs)
+      (goto-char (point-min))
+      (while (re-search-forward "\\[\\([^]]*\\)\\]{\\.paragraph-insertion[^}]*}" nil t)
+        (replace-match "{++\\1++}" t) (cl-incf n-ins))
+      (goto-char (point-min))
+      (while (re-search-forward "\\[\\([^]]*\\)\\]{\\.paragraph-deletion[^}]*}" nil t)
+        (replace-match "{--\\1--}" t) (cl-incf n-del))
+      ;; Inline insertions: [text]{.insertion author="..." date="..."} -> {++text++}
+      (goto-char (point-min))
+      (while (re-search-forward "\\[\\([^]]*\\)\\]{\\.insertion[^}]*}" nil t)
+        (replace-match "{++\\1++}" t) (cl-incf n-ins))
+      ;; Inline deletions: [text]{.deletion author="..." date="..."} -> {--text--}
+      (goto-char (point-min))
+      (while (re-search-forward "\\[\\([^]]*\\)\\]{\\.deletion[^}]*}" nil t)
+        (replace-match "{--\\1--}" t) (cl-incf n-del))
+      ;; Adjacent {--del--}{++ins++} pairs -> single {~~old~>new~~} substitution
+      (goto-char (point-min))
+      (while (re-search-forward
+              "{--\\([^{}]*?\\)--}\\(?:[[:space:]]*\\){\\+\\+\\([^{}]*?\\)\\+\\+}"
+              nil t)
+        (replace-match "{~~\\1~>\\2~~}" t)
+        (cl-decf n-ins) (cl-decf n-del) (cl-incf n-sub))
+      ;; Preserve docx anchor spans (e.g. `[]{#citeproc_bib_item_1 .anchor}'
+      ;; on each bibliography entry) by stripping the `.anchor' class.
+      ;; Pandoc's md->org writer drops a Span with [class] but preserves
+      ;; one with just an id, emitting it as `<<NAME>>'.  That round-trips
+      ;; back to a Word bookmark on docx export, so the existing in-text
+      ;; `[[#citeproc_bib_item_N][N]]' hyperlinks still resolve.
+      (goto-char (point-min))
+      (while (re-search-forward
+              "\\[\\]{\\(#[A-Za-z][A-Za-z0-9_-]*\\)[[:space:]]+\\.anchor}"
+              nil t)
+        (replace-match "[]{\\1}" t))
+      (write-file md-file))
+    (list :ins n-ins :del n-del :sub n-sub :hi n-hi :cmt n-cmt)))
+
+(defun otd--count (re)
+  "Count buffer-wide matches of RE."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((n 0)) (while (re-search-forward re nil t) (cl-incf n)) n)))
+
+(defun otd--preserve-leading-spaces (docx-in)
+  "Return a fresh .docx copy of DOCX-IN with leading regular spaces
+in `<w:t xml:space=\"preserve\">' runs replaced by NBSP (U+00A0).
+
+Pandoc's docx reader trims leading whitespace from cell text during
+AST parsing, dropping the visual indentation that signals hierarchy
+in a Word table (e.g. `  Age 68' nested under `Age, mean (SD), years').
+NBSP is preserved through the entire AST -> markdown -> org -> docx
+pipeline and renders identically in Word.
+
+Caller is responsible for `delete-file' on the returned path."
+  (let* ((tmpdir  (make-temp-file "otd-docx-" t))
+         (out     (make-temp-file "otd-docx-fixed-" nil ".docx"))
+         (doc-xml (expand-file-name "word/document.xml" tmpdir)))
+    (delete-file out)  ; zip refuses to write into an existing non-zip file
+    (condition-case err
+        (progn
+          (unless (zerop (call-process "unzip" nil nil nil
+                                       "-q" docx-in "-d" tmpdir))
+            (error "unzip failed on %s" docx-in))
+          (with-temp-buffer
+            (insert-file-contents doc-xml)
+            (goto-char (point-min))
+            (let ((nbsp (string ? )))
+              ;; Anchor on the literal `xml:space="preserve"' rather than a
+              ;; greedy `<w:t[^>]*...>' regexp.  `document.xml' is a single line
+              ;; and can contain very long bracket-free spans (e.g. a base64
+              ;; Mendeley citation blob in `<w:tag w:val="...">', ~450k chars):
+              ;; any unbounded greedy quantifier scanned across such a span
+              ;; overflows Emacs' regexp matcher stack ("Stack overflow in
+              ;; regexp matcher").  A literal `search-forward' plus bounded
+              ;; `looking-at' does no backtracking and is immune to line length.
+              (while (search-forward "xml:space=\"preserve\"" nil t)
+                (when (and (save-excursion
+                             (let ((lt (search-backward "<" nil t)))
+                               (and lt (looking-at "<w:t[ />]"))))
+                           (looking-at "[^<>]*>"))   ; remainder of start tag
+                  (goto-char (match-end 0))          ; just past the `>'
+                  (when (looking-at "[ \t]\\{2,\\}")
+                    (let ((n (- (match-end 0) (match-beginning 0))))
+                      (replace-match
+                       (apply #'concat (make-list n nbsp)) t t))))))
+            (write-region (point-min) (point-max) doc-xml nil 'silent))
+          (let ((default-directory (file-name-as-directory tmpdir)))
+            (unless (zerop (call-process "zip" nil nil nil
+                                         "-q" "-r" out "."))
+              (error "zip failed building %s" out)))
+          out)
+      (error
+       (delete-directory tmpdir t)
+       (when (file-exists-p out) (delete-file out))
+       (signal (car err) (cdr err))))
+    (delete-directory tmpdir t)
+    out))
+
+(defun otd--shield-grid-tables (md-file)
+  "Replace each pandoc grid_table block in MD-FILE with a unique
+alphanumeric sentinel.  Return an alist mapping each sentinel to
+the original grid_table text (including its trailing newline).
+
+Pandoc's md->org collapses grid_tables (multi-line cell capable)
+into org pipe tables (single-line cells), merging adjacent cell
+lines into single strings.  Shielding keeps them out of the org
+reader; the caller restores them as raw markdown export blocks."
+  (let ((alist nil) (id 0))
+    (with-temp-buffer
+      (insert-file-contents md-file)
+      (goto-char (point-min))
+      (while (re-search-forward "^\\+\\(?:[-=]+\\+\\)+[[:space:]]*$" nil t)
+        (let ((start (match-beginning 0)))
+          (goto-char start)
+          (forward-line 1)
+          (while (and (not (eobp))
+                      (looking-at "^[+|]"))
+            (forward-line 1))
+          (let* ((end  (point))
+                 (text (buffer-substring-no-properties start end))
+                 (n    (cl-incf id))
+                 (tag  (format "OTDGRIDTBLPHX%05dXEND" n)))
+            (delete-region start end)
+            (goto-char start)
+            (insert tag "\n")
+            (push (cons tag text) alist))))
+      (write-region (point-min) (point-max) md-file nil 'silent))
+    alist))
+
+(defun otd--restore-grid-tables (org-file alist)
+  "Replace each sentinel from ALIST in ORG-FILE with a `#+BEGIN_EXPORT
+markdown' block holding the original grid_table.  The block survives
+`otd-export's two-step org->md->docx pipeline as raw markdown, which
+pandoc's docx writer renders with multi-line cells intact."
+  (when alist
+    (with-temp-buffer
+      (insert-file-contents org-file)
+      (dolist (pair alist)
+        (goto-char (point-min))
+        (when (search-forward (car pair) nil t)
+          (replace-match
+           (concat "#+BEGIN_EXPORT markdown\n"
+                   (cdr pair)
+                   (unless (string-suffix-p "\n" (cdr pair)) "\n")
+                   "#+END_EXPORT")
+           t t)))
+      (write-region (point-min) (point-max) org-file nil 'silent))))
+
+(defun otd--read-pandoc-options (org-file)
+  "Return a list of pandoc CLI args derived from headers in ORG-FILE.
+
+Each `#+PANDOC_OPTIONS: key:value' line becomes `--key=value' (or
+`--key' for boolean t/true/yes).  This mirrors the convention used
+by ox-pandoc, so an existing canonical .org file works unchanged.
+
+Each `#+bibliography: path' line becomes `--bibliography=path',
+unless an equivalent `#+PANDOC_OPTIONS: bibliography:path' is also
+present (the explicit form wins).  This means a stock org-cite
+setup (#+bibliography + #+PANDOC_OPTIONS: citeproc:t + csl) is
+enough to get citations resolved into the docx output."
+  (let (args bib-pandoc bib-org)
+    (with-temp-buffer
+      (insert-file-contents org-file)
+      ;; #+PANDOC_OPTIONS: key:value
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^#\\+PANDOC_OPTIONS:[[:space:]]+\\([A-Za-z][A-Za-z0-9_-]*\\)[[:space:]]*:\\(.*\\)$"
+              nil t)
+        (let ((key (match-string 1))
+              (val (string-trim (match-string 2))))
+          (when (string= key "bibliography")
+            (push val bib-pandoc))
+          (cond
+           ((member val '("t" "true" "yes" "TRUE" "T" "Yes"))
+            (push (concat "--" key) args))
+           (t
+            (push (concat "--" key "=" val) args)))))
+      ;; #+bibliography: path
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^#\\+bibliography:[[:space:]]+\\(.*\\)$"
+              nil t)
+        (push (string-trim (match-string 1)) bib-org)))
+    (dolist (b (nreverse bib-org))
+      (unless (member b bib-pandoc)
+        (push (concat "--bibliography=" b) args)))
+    (nreverse args)))
+
+(defun otd--decode-image-paths (md-file)
+  "URL-decode `file://' URIs in markdown image links in MD-FILE.
+
+Pandoc emits image refs as `![alt](file:///path/with%20encoded%20spaces)'
+when reading from org.  The docx writer fails to embed such images
+because it tries to open the literal percent-encoded path on disk.
+Decoding here lets pandoc find the media file and embed it natively."
+  (require 'url-util)
+  (with-temp-buffer
+    (insert-file-contents md-file)
+    (goto-char (point-min))
+    (while (re-search-forward
+            "!\\[\\([^]]*\\)\\](file://\\([^)]+\\))"
+            nil t)
+      ;; `url-unhex-string' performs its own regex matching and clobbers
+      ;; the match data from the outer search, so `replace-match' would
+      ;; otherwise splice the new text into whatever sub-region url-util
+      ;; last matched -- leaving the original `file://' URL untouched and
+      ;; causing an infinite loop.  Isolate it with `save-match-data'.
+      (let* ((alt  (match-string 1))
+             (raw  (match-string 2))
+             (path (save-match-data (url-unhex-string raw))))
+        (replace-match (format "![%s](%s)" alt path) t t)))
+    (write-region (point-min) (point-max) md-file nil 'silent)))
+
+(defun otd--postfix-fixups ()
+  "Apply pandoc-org-reader fixups in the current buffer.
+Pandoc treats `^{...}'/`_{...}' as super/subscript only when glued to
+an alphanumeric character.  Several patterns produced during the docx
+-> md -> org import otherwise survive the next docx export as the
+literal four characters `^{N}':
+
+  - whitespace before the marker:  `text ^{41}',
+  - punctuation before the marker:  `(VETSA)^{28--30}', `/umx/^{40}',
+    `et al.^{47}', `]^{5,25}',
+  - Zotero-broken citation links wrapping the marker:
+    `[[https://www.zotero.org/google-docs/?broken=...][^{25}]]'
+    (the `[' before `^{' is matched by the punctuation rule below,
+    so the hyperlink is preserved and the superscript still attaches).
+
+Whitespace is stripped; punctuation gets a zero-width space inserted
+between it and the marker (pandoc treats U+200B as a non-space char,
+so the marker attaches without visibly changing the text)."
+  ;; Strip whitespace between a non-space char and `^{' or `_{'.
+  (goto-char (point-min))
+  (while (re-search-forward
+          "\\([^[:space:]]\\)[[:space:]]+\\(\\^\\|_\\){"
+          nil t)
+    (replace-match "\\1\\2{"))
+  ;; Insert U+200B between punctuation and `^{'/`_{' so pandoc's org
+  ;; reader sees a non-space, non-alphanumeric attachment point.  The
+  ;; ZWSP itself is excluded from the negative class so this is safe to
+  ;; run repeatedly.
+  (let ((zwsp (string ?​)))
+    (goto-char (point-min))
+    (while (re-search-forward
+            (concat "\\([^[:alnum:][:space:]" zwsp "]\\)\\(\\^\\|_\\){")
+            nil t)
+      (replace-match (concat "\\1" zwsp "\\2{")))))
+
+(defun otd--postfix-org (org-file)
+  "Apply `otd--postfix-fixups' to ORG-FILE on disk."
+  (with-temp-buffer
+    (insert-file-contents org-file)
+    (otd--postfix-fixups)
+    (write-region (point-min) (point-max) org-file nil 'silent)))
+
+;;;###autoload
+(defun otd-postfix-buffer ()
+  "Apply org-reader fixups to the current buffer in place.
+Use this once on a `-tracked.org' file imported before the fixups
+existed so a re-export to docx preserves super/subscripts."
+  (interactive)
+  (save-excursion (otd--postfix-fixups))
+  (message "otd-postfix-buffer: superscript adjacency normalised"))
+
+;;;; --- highlighting ----------------------------------------------------
+
+(defface otd-insert
+  '((t :inherit success :weight bold))
+  "Face for {++inserted++} text.")
+
+(defface otd-delete
+  '((t :inherit error :strike-through t))
+  "Face for {--deleted--} text.")
+
+(defface otd-substitute
+  '((t :inherit warning :slant italic))
+  "Face for {~~old~>new~~} substitutions.")
+
+(defface otd-comment
+  '((t :inherit shadow :slant italic))
+  "Face for {>>comment<<} reviewer comments.")
+
+(defface otd-highlight
+  '((t :inherit highlight))
+  "Face for {==highlighted==} text.")
+
+;; Pandoc may stamp {++[author]++} or {--[author]--} attributions; we
+;; tolerate the optional [author] prefix inside the markers.
+(defvar otd--keywords
+  '(("{\\+\\+\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)\\+\\+}" 0 'otd-insert     prepend)
+    ("{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}"          0 'otd-delete     prepend)
+    ("{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}"             0 'otd-substitute prepend)
+    ("{>>[^{}<]*<<}"                                    0 'otd-comment    prepend)
+    ("{==[^=]*==}"                                      0 'otd-highlight  prepend))
+  "Font-lock keywords for CriticMarkup tokens.")
+
+;;;###autoload
+(define-minor-mode otd-criticmarkup-mode
+  "Minor mode that fontifies CriticMarkup tokens.
+Use \\[otd-accept-all] / \\[otd-reject-all] to flatten changes."
+  :lighter " CM"
+  (if otd-criticmarkup-mode
+      (font-lock-add-keywords nil otd--keywords 'append)
+    (font-lock-remove-keywords nil otd--keywords))
+  (font-lock-flush))
+
+;;;; --- accept / reject -------------------------------------------------
+
+(defun otd--replace (re repl)
+  "Replace every match of RE with REPL across the buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (while (re-search-forward re nil t)
+      (replace-match repl t nil))))
+
+;;;###autoload
+(defun otd-accept-all ()
+  "Accept all CriticMarkup changes in the current buffer.
+Insertions are kept, deletions are dropped, substitutions take the new
+value, comments are dropped, highlights are kept as plain text."
+  (interactive)
+  (otd--replace "{\\+\\+\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)\\+\\+}" "\\1")
+  (otd--replace "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}"         "")
+  (otd--replace "{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}"            "\\2")
+  (otd--replace "{>>[^{}<]*<<}"                                   "")
+  (otd--replace "{==\\([^=]*\\)==}"                               "\\1"))
+
+;;;###autoload
+(defun otd-reject-all ()
+  "Reject all CriticMarkup changes in the current buffer (revert to original)."
+  (interactive)
+  (otd--replace "{\\+\\+\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)\\+\\+}" "")
+  (otd--replace "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}"         "\\1")
+  (otd--replace "{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}"            "\\1")
+  (otd--replace "{>>[^{}<]*<<}"                                   "")
+  (otd--replace "{==\\([^=]*\\)==}"                               "\\1"))
+
+;;;; --- compare against canonical org -----------------------------------
+
+;;;###autoload
+(defun otd-diff-against (canonical)
+  "Show a coloured word-diff between CANONICAL .org and current buffer.
+Run after `otd-import' on the docx returned by a co-author to see Word
+edits aligned to the org master."
+  (interactive
+   (list (read-file-name "Canonical .org: " nil nil t nil
+                         (lambda (f) (or (file-directory-p f)
+                                         (string-match-p "\\.org\\'" f))))))
+  (let ((current (buffer-file-name)))
+    (unless current (user-error "Buffer is not visiting a file"))
+    (with-current-buffer (get-buffer-create "*otd-diff*")
+      (let ((inhibit-read-only t)) (erase-buffer))
+      (call-process "git" nil t nil
+                    "--no-pager" "diff" "--no-index" "--no-color"
+                    "--word-diff=color" "--word-diff-regex=[A-Za-z0-9]+|[^[:space:]]"
+                    (expand-file-name canonical) current)
+      (goto-char (point-min))
+      (ansi-color-apply-on-region (point-min) (point-max))
+      (special-mode)
+      (display-buffer (current-buffer)))))
+
+;;;; --- embed / extract / merge (round-trip via customXml part) ---------
+
+(defconst otd--cx-item-name      "item-otd-source.xml")
+(defconst otd--cx-itemprops-name "itemProps-otd-source.xml")
+(defconst otd--cx-namespace      "urn:org-tracked-docx:source")
+(defconst otd--cxprop-name       "OrgTrackedSource"
+  "Name of the docProps/custom.xml fallback property holding the
+embedded org source, base64-encoded.  Word, LibreOffice, AND WPS
+Office preserve custom document properties across saves; some of
+them (notably WPS) strip the customXml/ part on save, so we write
+to both locations and read whichever survived.")
+
+(defun otd--xml-cdata-escape (s)
+  "Wrap S in a CDATA section, escaping any inner `]]>'."
+  (concat "<![CDATA["
+          (replace-regexp-in-string "]]>" "]]]]><![CDATA[>" s t t)
+          "]]>"))
+
+(defun otd--embed-org-source (docx-path org-path)
+  "Embed ORG-PATH content inside DOCX-PATH as a customXml part.
+Properly registers the part in [Content_Types].xml and the document
+relationships so Word/LibreOffice preserve it across edits.  Counterpart
+to `otd--extract-org-source'."
+  (let* ((tmpdir (make-temp-file "otd-embed-" t))
+         (org-content (with-temp-buffer
+                        (insert-file-contents org-path)
+                        (buffer-string))))
+    (condition-case err
+        (progn
+          (unless (zerop (call-process "unzip" nil nil nil
+                                       "-q" docx-path "-d" tmpdir))
+            (error "unzip failed on %s" docx-path))
+          (let ((cx-dir (expand-file-name "customXml" tmpdir)))
+            (make-directory cx-dir t)
+            (make-directory (expand-file-name "_rels" cx-dir) t)
+            (with-temp-file (expand-file-name otd--cx-item-name cx-dir)
+              (insert "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+                      "<orgTrackedSource xmlns=\"" otd--cx-namespace "\">"
+                      (otd--xml-cdata-escape org-content)
+                      "</orgTrackedSource>\n"))
+            (with-temp-file (expand-file-name otd--cx-itemprops-name cx-dir)
+              (insert "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+                      "<ds:datastoreItem ds:itemID=\"{ORG-TRACKED-DOCX-SOURCE}\""
+                      " xmlns:ds=\"http://schemas.openxmlformats.org/officeDocument/2006/customXml\">"
+                      "<ds:schemaRefs><ds:schemaRef ds:uri=\""
+                      otd--cx-namespace "\"/></ds:schemaRefs>"
+                      "</ds:datastoreItem>\n"))
+            (with-temp-file (expand-file-name (concat "_rels/" otd--cx-item-name ".rels")
+                                              cx-dir)
+              (insert "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+                      "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+                      "<Relationship Id=\"rId1\""
+                      " Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps\""
+                      " Target=\"" otd--cx-itemprops-name "\"/>"
+                      "</Relationships>\n")))
+          ;; [Content_Types].xml — register the new parts.
+          (let ((ct (expand-file-name "[Content_Types].xml" tmpdir)))
+            (with-temp-buffer
+              (insert-file-contents ct)
+              (goto-char (point-min))
+              (when (re-search-forward "</Types>" nil t)
+                (goto-char (match-beginning 0))
+                (insert "<Override PartName=\"/customXml/" otd--cx-item-name
+                        "\" ContentType=\"application/xml\"/>"
+                        "<Override PartName=\"/customXml/" otd--cx-itemprops-name
+                        "\" ContentType=\"application/vnd.openxmlformats-officedocument.customXmlProperties+xml\"/>"))
+              (write-region (point-min) (point-max) ct nil 'silent)))
+          ;; word/_rels/document.xml.rels — point document at the customXml part.
+          (let ((rels (expand-file-name "word/_rels/document.xml.rels" tmpdir))
+                (max-id 0))
+            (with-temp-buffer
+              (insert-file-contents rels)
+              (goto-char (point-min))
+              (while (re-search-forward "Id=\"rId\\([0-9]+\\)\"" nil t)
+                (setq max-id (max max-id (string-to-number (match-string 1)))))
+              (goto-char (point-min))
+              (when (re-search-forward "</Relationships>" nil t)
+                (goto-char (match-beginning 0))
+                (insert (format "<Relationship Id=\"rId%d\"" (1+ max-id))
+                        " Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml\""
+                        " Target=\"../customXml/" otd--cx-item-name "\"/>"))
+              (write-region (point-min) (point-max) rels nil 'silent)))
+          ;; Belt-and-braces: also embed in docProps/custom.xml as a
+          ;; base64 property.  WPS Office strips customXml/ on save but
+          ;; keeps custom document properties; this redundant copy is
+          ;; what lets the round-trip survive a WPS edit.
+          (otd--embed-custom-property tmpdir org-content)
+          ;; Repackage.
+          (delete-file docx-path)
+          (let ((default-directory (file-name-as-directory tmpdir)))
+            (unless (zerop (call-process "zip" nil nil nil "-q" "-r" docx-path "."))
+              (error "zip failed building %s" docx-path))))
+      (error
+       (delete-directory tmpdir t)
+       (signal (car err) (cdr err))))
+    (delete-directory tmpdir t)
+    docx-path))
+
+(defun otd--embed-custom-property (tmpdir org-content)
+  "Embed ORG-CONTENT (base64-encoded) as `OrgTrackedSource' property
+in docProps/custom.xml inside TMPDIR (an extracted docx tree).
+Creates and registers custom.xml if pandoc didn't already emit it."
+  (let* ((cxp (expand-file-name "docProps/custom.xml" tmpdir))
+         (b64 (base64-encode-string
+               (encode-coding-string org-content 'utf-8) t)))
+    ;; If pandoc didn't write docProps/custom.xml, create it now and
+    ;; register it in [Content_Types].xml + _rels/.rels.
+    (unless (file-exists-p cxp)
+      (make-directory (expand-file-name "docProps" tmpdir) t)
+      (with-temp-file cxp
+        (insert "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+                "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\""
+                " xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">"
+                "</Properties>\n"))
+      ;; [Content_Types].xml override
+      (let ((ct (expand-file-name "[Content_Types].xml" tmpdir)))
+        (when (file-exists-p ct)
+          (with-temp-buffer
+            (insert-file-contents ct)
+            (goto-char (point-min))
+            (unless (search-forward "/docProps/custom.xml" nil t)
+              (goto-char (point-min))
+              (when (re-search-forward "</Types>" nil t)
+                (goto-char (match-beginning 0))
+                (insert "<Override PartName=\"/docProps/custom.xml\""
+                        " ContentType=\"application/vnd.openxmlformats-officedocument.custom-properties+xml\"/>")))
+            (write-region (point-min) (point-max) ct nil 'silent))))
+      ;; Top-level _rels/.rels relationship
+      (let ((rels (expand-file-name "_rels/.rels" tmpdir))
+            (max-id 0))
+        (when (file-exists-p rels)
+          (with-temp-buffer
+            (insert-file-contents rels)
+            (goto-char (point-min))
+            (unless (search-forward "docProps/custom.xml" nil t)
+              (goto-char (point-min))
+              (while (re-search-forward "Id=\"rId\\([0-9]+\\)\"" nil t)
+                (setq max-id (max max-id (string-to-number (match-string 1)))))
+              (goto-char (point-min))
+              (when (re-search-forward "</Relationships>" nil t)
+                (goto-char (match-beginning 0))
+                (insert (format "<Relationship Id=\"rId%d\"" (1+ max-id))
+                        " Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties\""
+                        " Target=\"docProps/custom.xml\"/>")))
+            (write-region (point-min) (point-max) rels nil 'silent)))))
+    (with-temp-buffer
+      (insert-file-contents cxp)
+      ;; Drop any stale OrgTrackedSource property from a previous embed.
+      (goto-char (point-min))
+      (while (re-search-forward
+              (concat "<property[^>]*name=\""
+                      (regexp-quote otd--cxprop-name)
+                      "\"[^>]*>[^<]*\\(?:<[^>]+>[^<]*</[^>]+>\\)*</property>")
+              nil t)
+        (replace-match "" t t))
+      ;; Compute a fresh pid (must be >= 2 and unique per ECMA-376).
+      (let ((max-pid 1))
+        (goto-char (point-min))
+        (while (re-search-forward "pid=\"\\([0-9]+\\)\"" nil t)
+          (setq max-pid (max max-pid (string-to-number (match-string 1)))))
+        (goto-char (point-min))
+        (when (re-search-forward "</Properties>" nil t)
+          (goto-char (match-beginning 0))
+          (insert (format "<property fmtid=\"{D5CDD505-2E9C-101B-9397-08002B2CF9AE}\" pid=\"%d\" name=\"%s\"><vt:lpwstr>%s</vt:lpwstr></property>"
+                          (1+ max-pid) otd--cxprop-name b64))))
+      (write-region (point-min) (point-max) cxp nil 'silent))))
+
+(defun otd--extract-org-source (docx-path)
+  "Return the embedded org source from DOCX-PATH or nil.
+Tries the customXml/ part first (preserved by Word and LibreOffice),
+falls back to the docProps/custom.xml `OrgTrackedSource' property
+\(preserved by WPS Office and other tools that strip customXml/)."
+  (or (otd--extract-org-source-customxml docx-path)
+      (otd--extract-org-source-property  docx-path)))
+
+(defun otd--extract-org-source-property (docx-path)
+  "Extract source from docProps/custom.xml OrgTrackedSource property."
+  (with-temp-buffer
+    (when (zerop (call-process "unzip" nil t nil "-p"
+                               docx-path "docProps/custom.xml"))
+      (goto-char (point-min))
+      (when (re-search-forward
+             (concat "<property[^>]*name=\""
+                     (regexp-quote otd--cxprop-name)
+                     "\"[^>]*>[[:space:]]*<vt:lpwstr>\\([^<]*\\)</vt:lpwstr>")
+             nil t)
+        (let ((b64 (match-string 1)))
+          (when (and b64 (not (string-empty-p b64)))
+            (decode-coding-string (base64-decode-string b64) 'utf-8)))))))
+
+(defun otd--extract-org-source-customxml (docx-path)
+  "Extract source from a customXml/ part by content (LibreOffice
+renames our `item-otd-source.xml' to `item1.xml' on save, so we
+identify the part by its `<orgTrackedSource>' element)."
+  (let ((entries
+         (with-temp-buffer
+           (call-process "unzip" nil t nil "-Z1" docx-path)
+           (split-string (buffer-string) "\n" t)))
+        result)
+    (dolist (entry entries)
+      (when (and (not result)
+                 (string-match-p "^customXml/[^/]+\\.xml$" entry))
+        (with-temp-buffer
+          (when (zerop (call-process "unzip" nil t nil "-p" docx-path entry))
+            (goto-char (point-min))
+            (when (re-search-forward
+                   (concat "<orgTrackedSource[^>]*xmlns=\""
+                           (regexp-quote otd--cx-namespace)
+                           "\"[^>]*>[[:space:]]*<!\\[CDATA\\[")
+                   nil t)
+              (let ((start (point)))
+                (goto-char (point-max))
+                (when (re-search-backward
+                       "\\]\\]>[[:space:]]*</orgTrackedSource>"
+                       nil t)
+                  (let ((raw (buffer-substring-no-properties
+                              start (match-beginning 0))))
+                    (setq result
+                          (replace-regexp-in-string
+                           "]]]]><!\\[CDATA\\[>" "]]>" raw t t))))))))))
+    result))
+
+;;;###autoload
+(defun otd-extract-source (docx)
+  "Extract the embedded org source from DOCX and write it next to it
+as `<basename>-source.org'.  Errors if no embedded source is found."
+  (interactive
+   (list (read-file-name "Docx file: " nil nil t nil
+                         (lambda (f) (or (file-directory-p f)
+                                         (string-match-p "\\.docx\\'" f))))))
+  (let* ((dir (file-name-directory (expand-file-name docx)))
+         (base (file-name-sans-extension (file-name-nondirectory docx)))
+         (out (expand-file-name (concat base "-source.org") dir))
+         (src (otd--extract-org-source (expand-file-name docx))))
+    (unless src
+      (user-error "No embedded org source in %s" (file-name-nondirectory docx)))
+    (with-temp-file out (insert src))
+    (find-file out)
+    (message "Extracted source -> %s" (file-name-nondirectory out))
+    out))
+
+;;;; --- merge (canonical org + lossy tracked org) -----------------------
+
+(defun otd--strip-criticmarkup (text)
+  "Return TEXT with all CriticMarkup tokens flattened to the rejected
+state (insertions removed, deletions kept, substitutions take old,
+comments removed, highlights stripped of markers)."
+  (let ((s text))
+    (setq s (replace-regexp-in-string "{\\+\\+\\(?:\\[[^]]+\\]\\)?[^{}]*?\\+\\+}" "" s))
+    (setq s (replace-regexp-in-string "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}" "\\1" s))
+    (setq s (replace-regexp-in-string "{~~\\([^~{}]*?\\)~>[^~{}]*?~~}" "\\1" s))
+    (setq s (replace-regexp-in-string "{==\\([^=]*?\\)==}{>>[^<]*?<<}" "\\1" s))
+    (setq s (replace-regexp-in-string "{==\\([^=]*?\\)==}" "\\1" s))
+    (setq s (replace-regexp-in-string "{>>[^<]*?<<}" "" s))
+    s))
+
+(defun otd--has-criticmarkup-p (text)
+  "Return non-nil if TEXT contains any CriticMarkup token."
+  (string-match-p "{\\(\\+\\+\\|--\\|~~\\|==\\|>>\\)" text))
+
+(defconst otd--xref-rendered-regexp
+  (concat "\\b\\(?:"
+          "[Ff]ig\\(?:ure\\|\\.\\)\\|"
+          "[Ss]ec\\(?:tion\\|\\.\\)\\|"
+          "[Ee]q\\(?:uation\\|\\.\\)\\|"
+          "[Tt]bl\\.\\|[Tt]able\\|"
+          "[Ll]st\\.\\|[Ll]isting"
+          "\\)[\u00a0[:space:]]*[0-9]+\\(?:[.\u2013-][0-9]+\\)?\\b")
+  "Match a pandoc-crossref-rendered cross-ref like `fig. 1', `Sec. 2',
+`Equation 3', `tbl. 4', `Table 4-2', etc.  Used to collapse every
+rendered cross-ref to the same fingerprint as canonical's
+`[cite:@type:label]' (which the citation rule already collapses to
+`[CITE]') so paragraph alignment in the merge survives a docx
+roundtrip through pandoc-crossref.")
+
+(defun otd--normalize-for-match (text)
+  "Normalize TEXT for paragraph matching across canonical and tracked.
+Strips CriticMarkup, collapses every variant of citation AND cross-ref rendering
+\(citeproc anchor, org-cite, pandoc-org `cite/t', bare `[@key]') to a
+fixed `[CITE]' token, and collapses whitespace."
+  (let ((s (otd--strip-criticmarkup text)))
+    (setq s (replace-regexp-in-string
+             "\\[\\[#citeproc_bib_item_[0-9]+\\]\\[[0-9]+\\]\\]"
+             "[CITE]" s))
+    (setq s (replace-regexp-in-string
+             "\\[\\[cite\\(?:/[a-z]+\\)?:[^]]+\\]\\]" "[CITE]" s))
+    (setq s (replace-regexp-in-string
+             "\\[cite:[^]]+\\]" "[CITE]" s))
+    (setq s (replace-regexp-in-string
+             "\\[@[A-Za-z0-9_;,@[:space:]-]+\\]" "[CITE]" s))
+    ;; Anchored cross-ref (linkReferences=true): `sec. [[#sec:foo][2]]'.
+    (setq s (replace-regexp-in-string
+             "\\(?:\\b\\(?:[Ff]ig\\(?:ure\\|\\.\\)\\|[Ss]ec\\(?:tion\\|\\.\\)\\|[Ee]q\\(?:uation\\|\\.\\)\\|[Tt]bl\\.\\|[Tt]able\\|[Ll]st\\.\\|[Ll]isting\\)[\u00a0 ]+\\)?\\[\\[#\\(?:fig\\|sec\\|eq\\|tbl\\|lst\\):[^]]+\\]\\[[0-9]+\\]\\]"
+             "[CITE]" s))
+    ;; pandoc-crossref-rendered cross-refs: `fig. 1', `Section 2', etc.
+    (setq s (replace-regexp-in-string otd--xref-rendered-regexp "[CITE]" s))
+    ;; NBSP (U+00A0) appears in tracked text because `otd--preserve-leading-
+    ;; spaces' converts table-cell leading spaces; the canonical has regular
+    ;; spaces.  Treat them as equivalent for matching.
+    (setq s (replace-regexp-in-string "[ \t\n ]+" " " s))
+    (string-trim s)))
+
+(defun otd--build-cite-map (org-content)
+  "Walk ORG-CONTENT for `[cite:@key]' entries (including multi-key
+forms like `[cite:@a;@b]') and return an alist (key . N) ordered by
+first occurrence, mirroring pandoc-citeproc's numbering."
+  (let ((map nil) (n 0))
+    (with-temp-buffer
+      (insert org-content)
+      (goto-char (point-min))
+      (while (re-search-forward "\\[cite:\\([^]]+\\)\\]" nil t)
+        (let ((body (match-string 1)))
+          (dolist (k (split-string body "[;,[:space:]]+" t))
+            (when (string-prefix-p "@" k)
+              (let ((key (substring k 1)))
+                (unless (assoc key map)
+                  (cl-incf n)
+                  (push (cons key n) map))))))))
+    (nreverse map)))
+
+(defun otd--substitute-cite-keys (text cite-map)
+  "Convert lossy citation forms in TEXT back to canonical `[cite:@key]'.
+Handles all three forms pandoc emits when reading docx and writing org:
+- citeproc-anchored: `[[#citeproc_bib_item_N][N]]' (uses CITE-MAP for N->key)
+- pandoc-org reconstruction: `[[cite/t:@key]]' / `[[cite:@key]]'
+- bare: `[@key]'"
+  (let ((s text))
+    (dolist (entry cite-map)
+      (let* ((key (car entry))
+             (n   (cdr entry))
+             (re  (format "\\[\\[#citeproc_bib_item_%d\\]\\[%d\\]\\]" n n)))
+        (setq s (replace-regexp-in-string
+                 re (format "[cite:@%s]" key) s t t))))
+    (setq s (replace-regexp-in-string
+             "\\[\\[cite\\(?:/[a-z]+\\)?:\\([^]]+\\)\\]\\]"
+             "[cite:\\1]" s t))
+    (setq s (replace-regexp-in-string
+             "\\[\\(@[A-Za-z0-9_;,@[:space:]-]+\\)\\]"
+             "[cite:\\1]" s t))
+    s))
+
+(defun otd--build-xref-map (canonical)
+  "Walk CANONICAL for pandoc-crossref target definitions and return a
+plist mapping each cross-ref type to an alist of (LABEL . N), where
+N is the document-order number pandoc-crossref assigns at export.
+
+Detects:
+- :fig — `#+NAME: fig:LABEL'
+- :tbl — `#+NAME: tbl:LABEL'
+- :lst — `#+NAME: lst:LABEL'
+- :sec — `:CUSTOM_ID: sec:LABEL' under any heading
+- :eq  — `{#eq:LABEL}' anywhere (typically right after `$$ ... $$')
+
+Used by `otd--substitute-xrefs' to rewrite `fig. 1', `Section 2',
+etc. back to `[cite:@fig:LABEL]' form during merge."
+  (let ((figs nil) (secs nil) (eqs nil) (tbls nil) (lsts nil)
+        (n-fig 0) (n-sec 0) (n-eq 0) (n-tbl 0) (n-lst 0))
+    (with-temp-buffer
+      (insert canonical)
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^#\\+NAME:[ \t]*\\(fig\\|tbl\\|lst\\):\\([A-Za-z][A-Za-z0-9_:.-]*\\)"
+              nil t)
+        (let ((type  (downcase (match-string 1)))
+              (label (match-string 2)))
+          (cond
+           ((string= type "fig") (cl-incf n-fig) (push (cons label n-fig) figs))
+           ((string= type "tbl") (cl-incf n-tbl) (push (cons label n-tbl) tbls))
+           ((string= type "lst") (cl-incf n-lst) (push (cons label n-lst) lsts)))))
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^:CUSTOM_ID:[ \t]*sec:\\([A-Za-z][A-Za-z0-9_:.-]*\\)"
+              nil t)
+        (cl-incf n-sec) (push (cons (match-string 1) n-sec) secs))
+      (goto-char (point-min))
+      (while (re-search-forward "{#eq:\\([A-Za-z][A-Za-z0-9_:.-]*\\)}" nil t)
+        (cl-incf n-eq) (push (cons (match-string 1) n-eq) eqs)))
+    (list :fig (nreverse figs) :sec (nreverse secs)
+          :eq  (nreverse eqs)  :tbl (nreverse tbls) :lst (nreverse lsts))))
+
+(defun otd--substitute-xrefs (text xref-map)
+  "Replace pandoc-crossref-rendered cross-refs in TEXT with the canonical
+`[cite:@TYPE:LABEL]' form, using XREF-MAP from `otd--build-xref-map'.
+
+Recognises both abbreviated (`fig. 1', `Sec. 2') and long forms
+\(`Figure 1', `Section 2', `Equation 3', `Table 4', `Listing 5'),
+case-insensitively, with either a regular space or a non-breaking
+space between the prefix and the number (pandoc-crossref's default
+template uses NBSP)."
+  (let ((s text))
+    ;; Anchored form (linkReferences=true): pandoc emits
+    ;; `sec. [[#sec:foo][2]]' which carries the LABEL in the link target,
+    ;; so XREF-MAP isn't needed.  Strip the optional prefix word too --
+    ;; the cite key already names the type.
+    (setq s (replace-regexp-in-string
+             "\\(?:\\b\\(?:[Ff]ig\\(?:ure\\|\\.\\)\\|[Ss]ec\\(?:tion\\|\\.\\)\\|[Ee]q\\(?:uation\\|\\.\\)\\|[Tt]bl\\.\\|[Tt]able\\|[Ll]st\\.\\|[Ll]isting\\)[\u00a0 ]+\\)?\\[\\[#\\(\\(?:fig\\|sec\\|eq\\|tbl\\|lst\\):[^]]+\\)\\]\\[[0-9]+\\]\\]"
+             "[cite:@\\1]" s))
+    (cl-flet
+        ((sub (type-key prefix patterns)
+           (dolist (entry (plist-get xref-map type-key))
+             (let* ((label (car entry))
+                    (n     (cdr entry))
+                    (rep   (format "[cite:@%s:%s]" prefix label)))
+               (dolist (pat patterns)
+                 (setq s (replace-regexp-in-string
+                          (format pat n) rep s t t)))))))
+      (sub :fig "fig"
+           '("\\b[Ff]igure[  ]+%d\\b"
+             "\\b[Ff]ig\\.[  ]*%d\\b"))
+      (sub :sec "sec"
+           '("\\b[Ss]ection[  ]+%d\\b"
+             "\\b[Ss]ec\\.[  ]*%d\\b"))
+      (sub :eq  "eq"
+           '("\\b[Ee]quation[  ]+%d\\b"
+             "\\b[Ee]q\\.[  ]*%d\\b"))
+      (sub :tbl "tbl"
+           '("\\b[Tt]able[  ]+%d\\b"
+             "\\b[Tt]bl\\.[  ]*%d\\b"))
+      (sub :lst "lst"
+           '("\\b[Ll]isting[  ]+%d\\b"
+             "\\b[Ll]st\\.[  ]*%d\\b")))
+    s))
+
+(defun otd--split-paragraphs (content)
+  "Split CONTENT into paragraphs for merge alignment.
+
+A paragraph is a maximal run of consecutive non-blank lines that are
+not org headings (`*+ '), not property drawers (`:PROPERTIES:'..`:END:'),
+not export blocks (`#+BEGIN_EXPORT'..`#+END_EXPORT'), and not other
+keyword lines (`#+...').  Headings become their own one-line paragraphs;
+drawers, export blocks, and keyword lines are skipped from matching
+\(they are emitted by pandoc inconsistently between canonical and
+lossy versions and would otherwise prevent paragraph-level alignment)."
+  (let ((paras nil)
+        (current nil)
+        (in-drawer nil)
+        (in-export nil))
+    (dolist (line (split-string content "\n"))
+      (cond
+       ((string-match-p "^[ \t]*:PROPERTIES:[ \t]*$" line)
+        (setq in-drawer t))
+       ((and in-drawer (string-match-p "^[ \t]*:END:[ \t]*$" line))
+        (setq in-drawer nil))
+       (in-drawer)
+       ((string-match-p "^#\\+BEGIN_EXPORT" line)
+        (setq in-export t))
+       ((and in-export (string-match-p "^#\\+END_EXPORT" line))
+        (setq in-export nil))
+       (in-export)
+       ((string-match-p "^#\\+" line))     ;; skip keyword lines
+       ((string-empty-p (string-trim line))
+        (when current
+          (push (mapconcat #'identity (nreverse current) "\n") paras)
+          (setq current nil)))
+       ((string-match-p "^\\*+[ \t]" line)
+        (when current
+          (push (mapconcat #'identity (nreverse current) "\n") paras)
+          (setq current nil))
+        (push line paras))
+       (t (push line current))))
+    (when current
+      (push (mapconcat #'identity (nreverse current) "\n") paras))
+    (nreverse paras)))
+
+(defun otd--parse-comment-author (text)
+  "Parse a `[Author Name] rest…' prefix out of TEXT.
+Returns (AUTHOR . REST) when the prefix is present, otherwise (nil . TEXT).
+`otd--rewrite-spans' adds the prefix on import so `otd-export' can route
+the original reviewer name back to Word's `<w:comment w:author=…>'."
+  (if (string-match "\\`\\[\\([^][]+\\)\\][ \t]+\\(\\(?:.\\|\n\\)*\\)\\'" text)
+      (cons (match-string 1 text) (match-string 2 text))
+    (cons nil text)))
+
+(defun otd--scan-annotations (text)
+  "Return a list of (RANGE . CMT) pairs from TEXT.
+Balance-aware scan: walks `{==' / `==}' delimiters as a bracket stack
+so overlapping/nested `{==…==}{>>…<<}' annotations yield correct
+inner and outer pairs (regex with lazy `.*?' splits them wrong)."
+  (let ((pos 0)
+        (len (length text))
+        (stack nil)
+        (pairs nil))
+    (while (< pos len)
+      (let ((op (string-search "{==" text pos))
+            (cl (string-search "==}" text pos)))
+        (cond
+         ((and op (or (null cl) (< op cl)))
+          (push (+ op 3) stack)
+          (setq pos (+ op 3)))
+         (cl
+          (let ((start (pop stack)))
+            (if (and start
+                     (<= (+ cl 6) len)
+                     (string= (substring text (+ cl 3) (+ cl 6)) "{>>"))
+                (let ((cmt-end (string-search "<<}" text (+ cl 6))))
+                  (if cmt-end
+                      (progn
+                        (push (cons (substring text start cl)
+                                    (substring text (+ cl 6) cmt-end))
+                              pairs)
+                        (setq pos (+ cmt-end 3)))
+                    (setq pos (+ cl 3))))
+              (setq pos (+ cl 3)))))
+         (t (setq pos len)))))
+    (nreverse pairs)))
+
+(defun otd--anchor-all-positions (needle haystack &optional min-len)
+  "Return all unannotated start positions of NEEDLE in HAYSTACK, in order.
+Returns nil if NEEDLE is shorter than MIN-LEN (default 3) or empty
+after trimming.  A position is unannotated when it is not the content
+of an existing `{==…==}{>>…<<}' wrap (rough check on the surrounding
+chars)."
+  (let ((min (or min-len 3))
+        (nlen (length needle)))
+    (when (and (>= nlen min)
+               (not (string-empty-p (string-trim needle))))
+      (let ((start 0) (positions nil))
+        (while (let ((p (string-search needle haystack start)))
+                 (when p
+                   (let ((before (if (>= p 3) (substring haystack (- p 3) p) ""))
+                         (tail   (substring haystack (+ p nlen)
+                                            (min (length haystack)
+                                                 (+ p nlen 6)))))
+                     (unless (or (string= before "{==")
+                                 (string-prefix-p "==}{>>" tail))
+                       (push p positions)))
+                   (setq start (1+ p))
+                   p)))
+        (nreverse positions)))))
+
+(defun otd--anchor-unique-position (needle haystack &optional min-len)
+  "Return the unique unannotated start position of NEEDLE in HAYSTACK.
+Returns nil if NEEDLE is shorter than MIN-LEN (default 3), empty after
+trimming, or appears zero or 2+ times outside existing
+`{==…==}{>>…<<}' annotations."
+  (let ((positions (otd--anchor-all-positions needle haystack min-len)))
+    (when (= 1 (length positions))
+      (car positions))))
+
+(defun otd--anchor-candidates (range xref-map)
+  "Return a list of variant strings to try as anchors for RANGE.
+Mechanical substitutions covering the common pandoc-roundtrip
+divergences between tracked and canonical: em-dash, pandoc-crossref
+rendering (`Figure N' / `Table N' / `Section N'), and stripped-prefix
+caption text."
+  (let ((cands nil))
+    ;; em-dash variants (pandoc roundtrip may swap one for the other)
+    (push (replace-regexp-in-string "---" "—" range t t) cands)
+    (push (replace-regexp-in-string "—" "---" range t t) cands)
+    ;; cross-refs: substitute "Figure N" / "Table N" / "Section N" -> [cite:@type:label]
+    (cl-flet
+        ((sub (type-key prefix patterns)
+           (dolist (entry (plist-get xref-map type-key))
+             (let* ((label (car entry))
+                    (n     (cdr entry))
+                    (rep   (format "[cite:@%s:%s]" prefix label)))
+               (dolist (pat patterns)
+                 (push (replace-regexp-in-string (format pat n) rep range t)
+                       cands))))))
+      (sub :fig "fig"
+           '("\\b[Ff]igure[  ]+%d\\b"
+             "\\b[Ff]ig\\.[  ]*%d\\b"))
+      (sub :tbl "tbl"
+           '("\\b[Tt]able[  ]+%d\\b"
+             "\\b[Tt]bl\\.[  ]*%d\\b"))
+      (sub :sec "sec"
+           '("\\b[Ss]ection[  ]+%d\\b"
+             "\\b[Ss]ec\\.[  ]*%d\\b")))
+    ;; cross-ref STRIP: caption-style ranges like "Table 6: <text>" or
+    ;; "Figure 3: <text>" — pandoc-crossref renders the prefix, canonical
+    ;; has only the caption text after the colon.
+    (push (replace-regexp-in-string
+           "^[Tt]able[  ]+[0-9]+:[ \t ]*" "" range)
+          cands)
+    (push (replace-regexp-in-string
+           "^[Ff]igure[  ]+[0-9]+:[ \t ]*" "" range)
+          cands)
+    ;; emphasis-marker variants: ranges wrapping a phrase in markdown
+    ;; emphasis (`*Importance*', `**bold**') or org emphasis (`/italic/',
+    ;; `_under_', `=verb=', `~code~') won't substring-match canonical text
+    ;; that uses a different marker or none at all.  Try with surrounding
+    ;; markers stripped and with all internal markers stripped.
+    (push (replace-regexp-in-string "\\`[*/_=~]+\\|[*/_=~]+\\'" "" range) cands)
+    (push (replace-regexp-in-string "[*/_=~]" "" range) cands)
+    (delete-dups (delq nil cands))))
+
+(defun otd--reanchor-comments (merged tracked &optional xref-map)
+  "Splice reviewer comments from TRACKED into MERGED.
+For each `{==RANGE==}{>>CMT<<}' in TRACKED not already in MERGED, try
+to anchor it by substring search in MERGED.  Tiered strategy:
+exact -> mechanical variants from `otd--anchor-candidates' (em-dash,
+cross-ref) -> case-insensitive (for capitalization mismatches like a
+lowercase domain name in the tracked source vs Title Case in canonical).
+On each strategy, splice only if the candidate appears exactly once
+and is not already inside an existing annotation.  Returns
+(NEW-MERGED . N-GRAFTED)."
+  (let* ((doc-order (otd--scan-annotations tracked))
+         ;; Per (stripped-range) document-order index of each annotation.
+         ;; Used by tier 5 to pair tracked-Kth occurrence with canonical-Kth
+         ;; when a range matches multiple positions in canonical.
+         (ordinal (let ((seen (make-hash-table :test 'equal))
+                        (map  (make-hash-table :test 'eq)))
+                    (dolist (p doc-order)
+                      (let* ((r (string-trim (otd--strip-criticmarkup (car p))))
+                             (k (gethash r seen 0)))
+                        (puthash p k map)
+                        (puthash r (1+ k) seen)))
+                    map))
+         ;; Splice longest range first so an outer comment's substring is
+         ;; placed before a shorter inner overlap can break the outer text
+         ;; by inserting `{==…==}{>>…<<}' markers in the middle of it.
+         (annotations (sort (copy-sequence doc-order)
+                            (lambda (a b)
+                              (> (length (otd--strip-criticmarkup (car a)))
+                                 (length (otd--strip-criticmarkup (car b)))))))
+         (n 0)
+         (out merged))
+    (dolist (pair annotations)
+      (let* ((range-raw (car pair))
+             (range (string-trim (otd--strip-criticmarkup range-raw)))
+             (cmt   (cdr pair))
+             (wrap0 (format "{==%s==}{>>%s<<}" range cmt))
+             (rlen  (length range))
+             (placed nil))
+        (unless (or (< rlen 3)
+                    (string-search wrap0 out)
+                    ;; either variant of the wrap (em-dash flipped) already present
+                    (string-search (replace-regexp-in-string "---" "—" wrap0 t t) out))
+          ;; Tier 1: exact
+          (let ((p (otd--anchor-unique-position range out)))
+            (when p
+              (setq out (concat (substring out 0 p) wrap0
+                                (substring out (+ p rlen))))
+              (cl-incf n)
+              (setq placed t)))
+          ;; Tier 2: mechanical variants
+          (unless placed
+            (dolist (cand (otd--anchor-candidates range xref-map))
+              (unless placed
+                (let* ((clen (length cand))
+                       (p (otd--anchor-unique-position cand out)))
+                  (when p
+                    (let ((wrap (format "{==%s==}{>>%s<<}" cand cmt)))
+                      (setq out (concat (substring out 0 p) wrap
+                                        (substring out (+ p clen))))
+                      (cl-incf n)
+                      (setq placed t)))))))
+          ;; Tier 3: case-insensitive (requires a longer range to avoid false hits)
+          (unless placed
+            (when (>= rlen 8)
+              (let* ((lc-range (downcase range))
+                     (lc-out   (downcase out))
+                     (p (otd--anchor-unique-position lc-range lc-out 8)))
+                (when p
+                  ;; Splice using the actual canonical-case substring at that pos.
+                  (let* ((canon (substring out p (+ p rlen)))
+                         (wrap (format "{==%s==}{>>%s<<}" canon cmt)))
+                    (setq out (concat (substring out 0 p) wrap
+                                      (substring out (+ p rlen))))
+                    (cl-incf n)
+                    (setq placed t))))))
+          ;; Tier 4: progressive prefix truncation, applied to the raw range
+          ;; AND to each variant from `otd--anchor-candidates' (so e.g.
+          ;; "Table 6: <long caption>" can be reduced to a unique prefix of
+          ;; the stripped "<long caption>" form).  When canonical has been
+          ;; reworded near the tail of the commented sentence, the head
+          ;; still matches uniquely.  Tries 75/60/45/30/20/15 % prefixes;
+          ;; floor 16 chars to limit false-positive risk.
+          (unless placed
+            (when (>= rlen 24)
+              (let ((all-cands (cons range
+                                     (otd--anchor-candidates range xref-map))))
+                (cl-loop
+                 for cand in all-cands
+                 while (not placed)
+                 do
+                 (let ((clen (length cand)))
+                   (when (>= clen 24)
+                     (cl-loop
+                      for frac in '(0.75 0.6 0.45 0.3 0.2 0.15)
+                      for tlen = (max 16 (floor (* frac clen)))
+                      while (not placed)
+                      do
+                      (let* ((trunc (substring cand 0 (min clen tlen)))
+                             (p (otd--anchor-unique-position trunc out 16)))
+                        (when p
+                          (let ((wrap (format "{==%s==}{>>%s<<}"
+                                              trunc cmt)))
+                            (setq out (concat (substring out 0 p) wrap
+                                              (substring out (+ p tlen))))
+                            (cl-incf n)
+                            (setq placed t)))))))))))
+          ;; Tier 5: ordinal-position resolution for multi-match.  When a
+          ;; range appears multiple times in canonical and the same range
+          ;; is anchored by multiple tracked annotations (or only one but
+          ;; canonical has few occurrences), pair the K-th tracked
+          ;; occurrence with the K-th canonical occurrence in document
+          ;; order.  Floor 4 chars; skip if canonical has > 5 occurrences
+          ;; (too ambiguous to anchor safely).
+          (unless placed
+            (when (>= rlen 4)
+              (let ((positions (otd--anchor-all-positions range out 4))
+                    (k (gethash pair ordinal)))
+                (when (and positions
+                           k
+                           (<= (length positions) 5)
+                           (< k (length positions)))
+                  (let* ((p (nth k positions))
+                         (wrap (format "{==%s==}{>>%s<<}" range cmt)))
+                    (setq out (concat (substring out 0 p) wrap
+                                      (substring out (+ p rlen))))
+                    (cl-incf n)
+                    (setq placed t)))))))))
+    (cons out n)))
+
+(defun otd--merge-content (canonical tracked)
+  "Return merged content combining CANONICAL (cite keys, metadata,
+property drawers, etc.) with CriticMarkup tokens from TRACKED.
+
+Walks CANONICAL line-by-line, preserving its full structure.  For each
+body paragraph it computes a normalized fingerprint; if a CriticMarkup-
+bearing paragraph in TRACKED has the same fingerprint, that tracked
+paragraph (with citation forms back-substituted to `[cite:@key]') takes
+the canonical paragraph's place.  After the walk, any remaining tracked
+comments whose canonical anchor was missed by paragraph fingerprinting
+are re-anchored by `otd--reanchor-comments' (substring splice for
+exactly-once matches).
+
+Tracked paragraphs that match nothing in canonical (e.g. the docx
+bibliography section, which canonical does not contain because it is
+regenerated by citeproc on export) are dropped.
+
+Returns (MERGED-STRING . PLIST) where PLIST has keys
+:merged-paragraphs, :cm-paragraphs, :cite-keys, :reanchored-comments."
+  (let* ((cite-map (otd--build-cite-map canonical))
+         (xref-map (otd--build-xref-map canonical))
+         (cm-map (cl-loop for p in (otd--split-paragraphs tracked)
+                          when (otd--has-criticmarkup-p p)
+                          collect (cons (otd--normalize-for-match p) p)))
+         (n-merged 0)
+         (output nil)
+         (current nil)
+         (in-drawer nil)
+         (in-export nil))
+    (cl-labels
+        ((flush ()
+           (when current
+             (let* ((para (mapconcat #'identity (nreverse current) "\n"))
+                    (fp (otd--normalize-for-match para))
+                    (replacement (and (not (string-empty-p fp))
+                                      (cdr (assoc fp cm-map)))))
+               (push (if replacement
+                         (progn (cl-incf n-merged)
+                                (otd--substitute-xrefs
+                                 (otd--substitute-cite-keys replacement
+                                                            cite-map)
+                                 xref-map))
+                       para)
+                     output))
+             (setq current nil))))
+      (dolist (line (split-string canonical "\n"))
+        (cond
+         ((string-match-p "^[ \t]*:PROPERTIES:[ \t]*$" line)
+          (flush) (setq in-drawer t) (push line output))
+         ((and in-drawer (string-match-p "^[ \t]*:END:[ \t]*$" line))
+          (setq in-drawer nil) (push line output))
+         (in-drawer (push line output))
+         ((string-match-p "^#\\+BEGIN_EXPORT" line)
+          (flush) (setq in-export t) (push line output))
+         ((and in-export (string-match-p "^#\\+END_EXPORT" line))
+          (setq in-export nil) (push line output))
+         (in-export (push line output))
+         ((or (string-match-p "^#\\+" line)
+              (string-match-p "^\\*+[ \t]" line)
+              (string-empty-p (string-trim line)))
+          (flush) (push line output))
+         (t (push line current))))
+      (flush))
+    (let* ((merged-str (mapconcat #'identity (nreverse output) "\n"))
+           (re (otd--reanchor-comments merged-str tracked xref-map)))
+      (cons (car re)
+            (list :merged-paragraphs n-merged
+                  :cm-paragraphs (length cm-map)
+                  :cite-keys (length cite-map)
+                  :reanchored-comments (cdr re))))))
+
+;;;; --- export (CriticMarkup -> native Word tracked changes & comments) -
+
+;;;###autoload
+(defun otd-export (org-file &optional output)
+  "Export ORG-FILE to docx, converting CriticMarkup back to native
+Word tracked changes and comments.
+With prefix arg, prompt for OUTPUT path; otherwise the docx goes
+alongside ORG-FILE with the .docx extension.
+
+Pipeline:
+  1. Replace each CriticMarkup token in a copy of the org file with a
+     unique alphanumeric placeholder (so pandoc cannot mangle it).
+  2. pandoc org -> markdown on the placeholder-laden copy.
+  3. In the markdown, swap each placeholder for a pandoc native span:
+       {++text++}            -> [text]{.insertion}
+       {--text--}            -> [text]{.deletion}
+       {~~old~>new~~}        -> [old]{.deletion}[new]{.insertion}
+       {==range==}{>>c<<}    -> [c]{.comment-start id=N}range[]{.comment-end id=N}
+       {==range==} (orphan)  -> range  (highlights are dropped)
+       {>>c<<} (orphan)      -> [c]{.comment-start id=N}[]{.comment-end id=N}
+  4. pandoc markdown -> docx.  Pandoc emits real w:ins / w:del runs and
+     a real word/comments.xml from those spans.
+Author defaults to `otd-export-author'."
+  (interactive
+   (list (or (and (eq major-mode 'org-mode) (buffer-file-name))
+             (read-file-name "Org file: " nil nil t nil
+                             (lambda (f) (or (file-directory-p f)
+                                             (string-match-p "\\.org\\'" f)))))
+         (when current-prefix-arg (read-file-name "Output .docx: "))))
+  (unless (file-exists-p org-file) (user-error "File not found: %s" org-file))
+  (let* ((dir     (file-name-directory (expand-file-name org-file)))
+         (base    (file-name-sans-extension (file-name-nondirectory org-file)))
+         (out     (or output (expand-file-name (concat base ".docx") dir)))
+         (org-tmp (make-temp-file "otd-out-" nil ".org"))
+         (md-tmp  (make-temp-file "otd-out-" nil ".md"))
+         (alist   nil)
+         (counts  nil))
+    (unwind-protect
+        (progn
+          ;; Stage 1: fixups + CriticMarkup -> placeholders
+          (with-temp-buffer
+            (insert-file-contents org-file)
+            (otd--postfix-fixups)
+            (let ((res (otd--mark-criticmarkup)))
+              (setq alist  (car res)
+                    counts (cdr res)))
+            (write-region (point-min) (point-max) org-tmp nil 'silent))
+          ;; Stage 2: org -> markdown (placeholders pass through unchanged).
+          ;; `--standalone' is required to preserve `#+title:', `#+author:'
+          ;; etc. as YAML frontmatter; without it pandoc's markdown writer
+          ;; drops document metadata, which then never reaches docx.
+          (with-temp-buffer
+            (let ((exit (apply #'call-process otd-pandoc-program nil t nil
+                               (list "-f" "org" "-t" "markdown"
+                                     "--standalone" "--wrap=none"
+                                     org-tmp "-o" md-tmp))))
+              (unless (zerop exit)
+                (error "pandoc org->md exit %s:\n%s" exit (buffer-string)))))
+          ;; Stage 3a: decode `file://' image URIs so pandoc's docx
+          ;; writer can find and embed the referenced media.
+          (otd--decode-image-paths md-tmp)
+          ;; Stage 3b: placeholders -> pandoc native spans
+          (otd--unmark-criticmarkup md-tmp alist)
+          ;; Stage 4: markdown -> docx (real comments + tracked changes).
+          ;; User-supplied `#+PANDOC_OPTIONS:' and `#+bibliography:'
+          ;; headers are forwarded so citeproc, CSL, reference-doc, etc.
+          ;; behave the same as M-x org-pandoc-export-to-docx would.
+          (with-temp-buffer
+            (let* ((user-args (otd--read-pandoc-options org-file))
+                   (pandoc-args (append (list "-f" "markdown" "-t" "docx"
+                                              "--wrap=none" md-tmp "-o" out)
+                                        user-args))
+                   (exit (apply #'call-process otd-pandoc-program nil t nil
+                                pandoc-args)))
+              (unless (zerop exit)
+                (error "pandoc md->docx exit %s:\n%s" exit (buffer-string)))))
+          ;; Stage 5: embed the canonical org source as a customXml part
+          ;; so a future `otd-import' on the reviewed docx can recover
+          ;; cite keys / metadata that the docx body cannot represent.
+          (when otd-embed-source
+            (otd--embed-org-source out org-file))
+          (message "Exported %s -> %s  (++%d --%d ~~%d ==%d >>%d)"
+                   (file-name-nondirectory org-file)
+                   (file-name-nondirectory out)
+                   (plist-get counts :ins) (plist-get counts :del)
+                   (plist-get counts :sub) (plist-get counts :hi)
+                   (plist-get counts :cmt)))
+      (when (file-exists-p org-tmp) (delete-file org-tmp))
+      (when (file-exists-p md-tmp)  (delete-file md-tmp)))
+    out))
+
+(defun otd--mark-criticmarkup ()
+  "Replace CriticMarkup tokens in current buffer with sentinel placeholders.
+Return (ALIST . COUNTS) where ALIST maps each placeholder string to the
+pandoc-span replacement to splice in once we are out of the org reader,
+and COUNTS is a plist of token counts."
+  (let ((alist nil)
+        (id 0)
+        (n-ins 0) (n-del 0) (n-sub 0) (n-hi 0) (n-cmt 0)
+        (author (or otd-export-author ""))
+        (date   (format-time-string "%Y-%m-%dT%H:%M:%SZ" nil t)))
+    (cl-flet
+        ((stash (replacement)
+           (cl-incf id)
+           (let ((tag (format "OTDPHX%05dXEND" id)))
+             (push (cons tag replacement) alist)
+             tag)))
+      ;; {==range==}{>>comment<<} -> comment-start..comment-end pair
+      ;; If COMMENT begins with `[Author Name] ' (the prefix `otd--rewrite-spans'
+      ;; encodes on import), peel it off and use it as the docx author so the
+      ;; original reviewer name round-trips back to Word.
+      (goto-char (point-min))
+      (while (re-search-forward "{==\\([^=]*\\)==}{>>\\([^<]*\\)<<}" nil t)
+        (let* ((range (match-string 1))
+               (ctext-raw (match-string 2))
+               ;; save-match-data: `otd--parse-comment-author' calls
+               ;; `string-match' which clobbers the outer regex's match data
+               ;; before `replace-match' uses it.
+               (parsed (save-match-data
+                         (otd--parse-comment-author ctext-raw)))
+               (use-author (or (car parsed) author))
+               (ctext (cdr parsed))
+               (n     (1+ id)))
+          (replace-match
+           (stash (format "[%s]{.comment-start id=\"%d\" author=\"%s\" date=\"%s\"}%s[]{.comment-end id=\"%d\"}"
+                          ctext n use-author date range n))
+           t t))
+        (cl-incf n-cmt) (cl-incf n-hi))
+      ;; {~~old~>new~~} -> [old]{.deletion}[new]{.insertion}
+      (goto-char (point-min))
+      (while (re-search-forward "{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}" nil t)
+        (let ((old (match-string 1)) (new (match-string 2)))
+          (replace-match
+           (stash (format "[%s]{.deletion author=\"%s\" date=\"%s\"}[%s]{.insertion author=\"%s\" date=\"%s\"}"
+                          old author date new author date))
+           t t))
+        (cl-incf n-sub))
+      ;; {++text++} -> [text]{.insertion}
+      (goto-char (point-min))
+      (while (re-search-forward "{\\+\\+\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)\\+\\+}" nil t)
+        (let ((s (match-string 1)))
+          (replace-match
+           (stash (format "[%s]{.insertion author=\"%s\" date=\"%s\"}"
+                          s author date))
+           t t))
+        (cl-incf n-ins))
+      ;; {--text--} -> [text]{.deletion}
+      (goto-char (point-min))
+      (while (re-search-forward "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}" nil t)
+        (let ((s (match-string 1)))
+          (replace-match
+           (stash (format "[%s]{.deletion author=\"%s\" date=\"%s\"}"
+                          s author date))
+           t t))
+        (cl-incf n-del))
+      ;; Orphan {==range==} (no following comment): drop markers, keep text.
+      (goto-char (point-min))
+      (while (re-search-forward "{==\\([^=]*\\)==}" nil t)
+        (replace-match (stash (match-string 1)) t t)
+        (cl-incf n-hi))
+      ;; Orphan {>>comment<<}: zero-range comment so it still appears in Word.
+      (goto-char (point-min))
+      (while (re-search-forward "{>>\\([^<]*\\)<<}" nil t)
+        (let* ((ctext-raw (match-string 1))
+               (parsed (save-match-data
+                         (otd--parse-comment-author ctext-raw)))
+               (use-author (or (car parsed) author))
+               (ctext (cdr parsed))
+               (n     (1+ id)))
+          (replace-match
+           (stash (format "[%s]{.comment-start id=\"%d\" author=\"%s\" date=\"%s\"}[]{.comment-end id=\"%d\"}"
+                          ctext n use-author date n))
+           t t))
+        (cl-incf n-cmt)))
+    (cons alist
+          (list :ins n-ins :del n-del :sub n-sub :hi n-hi :cmt n-cmt))))
+
+(defun otd--unmark-criticmarkup (md-file alist)
+  "Replace each ALIST placeholder with its pandoc-span value in MD-FILE."
+  (with-temp-buffer
+    (insert-file-contents md-file)
+    (dolist (pair alist)
+      (goto-char (point-min))
+      (while (search-forward (car pair) nil t)
+        (replace-match (cdr pair) t t)))
+    (write-region (point-min) (point-max) md-file nil 'silent)))
+
+(provide 'org-tracked-docx)
+;;; org-tracked-docx.el ends here

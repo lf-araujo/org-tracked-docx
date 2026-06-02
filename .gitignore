@@ -1,0 +1,13 @@
+# Emacs
+*.elc
+*~
+\#*\#
+.\#*
+
+# pandoc / import byproducts
+*-tracked.org
+*-source.org
+*-media/
+
+# OS
+.DS_Store
