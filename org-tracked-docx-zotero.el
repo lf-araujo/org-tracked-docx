@@ -2,7 +2,12 @@
 
 ;; Author: drafted with Claude
 ;; Keywords: org, pandoc, docx, track changes, zotero
-;; Package-Requires: ((emacs "27.1") (org-tracked-docx "0.1"))
+;; Package-Requires: ((emacs "27.1"))
+;; This file ships inside the org-tracked-docx package and `require's
+;; org-tracked-docx at runtime; it deliberately does NOT list it under
+;; Package-Requires.  Doing so makes package-vc's scraped descriptor declare
+;; the package as a dependency of itself, sending package-activate into
+;; infinite recursion ("excessive-lisp-nesting") on install/startup.
 
 ;;; Commentary:
 ;;
