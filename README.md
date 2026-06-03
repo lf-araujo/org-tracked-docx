@@ -39,6 +39,21 @@ accept/reject and merge against the canonical org source.
 - `M-x otd-accept-all` / `M-x otd-reject-all` — flatten tracked markup.
 - `M-x otd-diff-against` — word-diff the imported file against the canonical org.
 
+### Auto-import on open
+
+Enable `otd-auto-import-mode` to make Emacs run `otd-import` whenever you
+visit a `.docx` (via `find-file`, dired `RET`, desktop restore, …) and show
+the imported CriticMarkup org buffer instead of raw binary:
+
+```elisp
+(otd-auto-import-mode 1)
+```
+
+If the matching `…-tracked.org` already exists and is at least as new as the
+docx, the existing import is reused rather than re-run (so your edits aren't
+clobbered); a newer docx is re-imported. Toggle this with
+`otd-auto-import-reuse`. If pandoc fails, the docx opens normally.
+
 ## Notes
 
 `otd--preserve-leading-spaces` rewrites leading spaces in
