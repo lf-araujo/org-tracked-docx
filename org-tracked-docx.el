@@ -33,6 +33,7 @@
 ;;; Code:
 
 (require 'subr-x)
+(require 'cl-lib)
 (require 'ansi-color)
 
 (defgroup org-tracked-docx nil
@@ -123,13 +124,25 @@ Pipeline:
             ;; Stage 2b: shield grid_tables (multi-line cells) with sentinels
             ;; so pandoc's md->org cannot collapse them into pipe-table rows.
             (setq grid-alist (otd--shield-grid-tables md-tmp))
-            ;; Stage 3: markdown (with CriticMarkup) -> org; tokens pass through
-            (with-temp-buffer
-              (let ((exit (apply #'call-process otd-pandoc-program nil t nil
-                                 (list "-f" "markdown" "-t" "org"
-                                       "--wrap=none" md-tmp "-o" out))))
-                (unless (zerop exit)
-                  (error "pandoc md->org exit %s:\n%s" exit (buffer-string)))))
+            ;; Stage 2c: stash CriticMarkup tokens as opaque alphanumeric
+            ;; sentinels so pandoc's md->org pass cannot mangle them.
+            ;; Without this `{~~old~>new~~}` is parsed as strikethrough +
+            ;; subscript and gets corrupted to `{+old~>new+}` / `{+old_{>new}~}`
+            ;; (we saw 23/23 substitutions destroyed before this stash); the
+            ;; same risk applies to any `{++...++}` containing a `^...^`
+            ;; superscript run, hence the bracket-balanced sentinel rather
+            ;; than a regex disable of the offending extensions, which would
+            ;; also clobber legitimate inline super/subscript content.
+            (let ((cm-alist (otd--stash-criticmarkup md-tmp)))
+              ;; Stage 3: markdown (with sentinels) -> org
+              (with-temp-buffer
+                (let ((exit (apply #'call-process otd-pandoc-program nil t nil
+                                   (list "-f" "markdown" "-t" "org"
+                                         "--wrap=none" md-tmp "-o" out))))
+                  (unless (zerop exit)
+                    (error "pandoc md->org exit %s:\n%s" exit (buffer-string)))))
+              ;; Stage 3a: restore CriticMarkup tokens in the org output.
+              (otd--unstash-criticmarkup out cm-alist))
             ;; Stage 3b: restore shielded grid_tables as raw markdown blocks
             ;; (`#+BEGIN_EXPORT markdown' survives the org->md->docx round-trip
             ;; in `otd-export', so the multi-line cell structure is preserved).
@@ -263,14 +276,44 @@ Return a plist with counts of each marker emitted."
       (goto-char (point-min))
       (while (re-search-forward "\\[\\([^]]*\\)\\]{\\.paragraph-deletion[^}]*}" nil t)
         (replace-match "{--\\1--}" t) (cl-incf n-del))
-      ;; Inline insertions: [text]{.insertion author="..." date="..."} -> {++text++}
-      (goto-char (point-min))
-      (while (re-search-forward "\\[\\([^]]*\\)\\]{\\.insertion[^}]*}" nil t)
-        (replace-match "{++\\1++}" t) (cl-incf n-ins))
-      ;; Inline deletions: [text]{.deletion author="..." date="..."} -> {--text--}
-      (goto-char (point-min))
-      (while (re-search-forward "\\[\\([^]]*\\)\\]{\\.deletion[^}]*}" nil t)
-        (replace-match "{--\\1--}" t) (cl-incf n-del))
+      ;; Inline insertions/deletions: [text]{.insertion ...} / [text]{.deletion ...}
+      ;; Reviewer insertions can wrap text containing `]` characters (inserted
+      ;; citations like `[@key]`, nested attribute spans, etc.); a plain
+      ;; `[^]]*' regex drops every such hit.  Walk the buffer instead with a
+      ;; balanced-bracket scan: locate each `]{.insertion' / `]{.deletion'
+      ;; marker, then count brackets backwards to find the matching `['.
+      ;; Counter is a 1-element list so the cl-flet helper can mutate it
+      ;; without depending on dynamic binding of the let-bound n-ins/n-del.
+      (let ((ins-box (list 0))
+            (del-box (list 0)))
+        (cl-flet
+            ((rewrite-span (class open-marker close-marker box)
+               (goto-char (point-min))
+               (let ((tag-re (concat (regexp-quote (concat "]{." class))
+                                     "[^}]*}")))
+                 (while (re-search-forward tag-re nil t)
+                   (let* ((mend  (match-end 0))
+                          (rbpos (match-beginning 0)) ; pos of `]'
+                          (depth 1)
+                          (p     (1- rbpos))          ; scan back from before `]'
+                          (open  nil))
+                     (while (and (> p (point-min)) (> depth 0))
+                       (let ((c (char-after p)))
+                         (cond ((eq c ?\]) (cl-incf depth))
+                               ((eq c ?\[) (cl-decf depth)
+                                (when (zerop depth) (setq open p)))))
+                       (setq p (1- p)))
+                     (when open
+                       (let ((text (buffer-substring-no-properties
+                                    (1+ open) rbpos)))
+                         (delete-region open mend)
+                         (goto-char open)
+                         (insert open-marker text close-marker)
+                         (setcar box (1+ (car box))))))))))
+          (rewrite-span "insertion" "{++" "++}" ins-box)
+          (rewrite-span "deletion"  "{--" "--}" del-box))
+        (cl-incf n-ins (car ins-box))
+        (cl-incf n-del (car del-box)))
       ;; Adjacent {--del--}{++ins++} pairs -> single {~~old~>new~~} substitution
       (goto-char (point-min))
       (while (re-search-forward
@@ -297,6 +340,71 @@ Return a plist with counts of each marker emitted."
   (save-excursion
     (goto-char (point-min))
     (let ((n 0)) (while (re-search-forward re nil t) (cl-incf n)) n)))
+
+(defun otd--stash-criticmarkup (md-file)
+  "Replace every CriticMarkup token in MD-FILE with an opaque sentinel.
+Return an alist mapping each sentinel string to the original token
+text.  Stage 3 (`pandoc md->org') would otherwise parse `~~..~~' as
+strikethrough and `~..~' as subscript, mangling `{~~old~>new~~}'
+substitutions and any `{++..++}'/`{--..--}' containing such characters.
+Sentinels are alphanumeric (`OTDIMP00001ZEND') and survive pandoc
+untouched; `otd--unstash-criticmarkup' restores them in the org output."
+  (let ((alist nil)
+        (id 0))
+    (with-temp-buffer
+      (insert-file-contents md-file)
+      (cl-flet
+          ((stash-region (start end)
+             (cl-incf id)
+             (let* ((token (buffer-substring-no-properties start end))
+                    (tag   (format "OTDIMP%05dZEND" id)))
+               (push (cons tag token) alist)
+               (delete-region start end)
+               (goto-char start)
+               (insert tag))))
+        ;; Order matters: handle substitutions and highlight+comment pairs
+        ;; before bare insertions/deletions so the outer brackets are
+        ;; stashed first.  Each pattern is anchored to its full closing
+        ;; delimiter so inner `{++..++}' tokens are NOT prematurely stashed
+        ;; inside a `{==..==}{>>..<<}' highlight (the comment text often
+        ;; contains other markup that should travel inside the sentinel).
+        (goto-char (point-min))
+        (while (re-search-forward
+                "{==\\(?:[^{}]\\|{[^{}]*}\\)*?==}{>>\\(?:[^<>]\\|<[^<>]*>\\)*?<<}"
+                nil t)
+          (stash-region (match-beginning 0) (match-end 0)))
+        (goto-char (point-min))
+        (while (re-search-forward "{~~[^{}]*?~~}" nil t)
+          (stash-region (match-beginning 0) (match-end 0)))
+        (goto-char (point-min))
+        (while (re-search-forward "{\\+\\+[^{}]*?\\+\\+}" nil t)
+          (stash-region (match-beginning 0) (match-end 0)))
+        (goto-char (point-min))
+        (while (re-search-forward "{--[^{}]*?--}" nil t)
+          (stash-region (match-beginning 0) (match-end 0)))
+        ;; Orphan highlights (no following comment) and orphan comments.
+        (goto-char (point-min))
+        (while (re-search-forward "{==[^{}]*?==}" nil t)
+          (stash-region (match-beginning 0) (match-end 0)))
+        (goto-char (point-min))
+        (while (re-search-forward "{>>\\(?:[^<>]\\|<[^<>]*>\\)*?<<}" nil t)
+          (stash-region (match-beginning 0) (match-end 0))))
+      (write-file md-file))
+    alist))
+
+(defun otd--unstash-criticmarkup (org-file alist)
+  "Replace OTDIMP sentinels in ORG-FILE with the original CriticMarkup
+tokens from ALIST (produced by `otd--stash-criticmarkup')."
+  (when alist
+    (with-temp-buffer
+      (insert-file-contents org-file)
+      (dolist (entry alist)
+        (let ((tag (car entry))
+              (val (cdr entry)))
+          (goto-char (point-min))
+          (while (search-forward tag nil t)
+            (replace-match val t t))))
+      (write-file org-file))))
 
 (defun otd--preserve-leading-spaces (docx-in)
   "Return a fresh .docx copy of DOCX-IN with leading regular spaces
@@ -1331,20 +1439,69 @@ and is not already inside an existing annotation.  Returns
                     (setq placed t)))))))))
     (cons out n)))
 
+(defun otd--align-paragraphs (canon-paras tracked-paras)
+  "Two-pointer align CANON-PARAS to TRACKED-PARAS by normalized fingerprint.
+Returns a vector of length (length CANON-PARAS); index I holds the
+tracked-paragraph string aligned to canonical paragraph I, or nil when
+no aligned tracked paragraph exists (canonical extends past tracked).
+
+Why positional + fingerprint, not fingerprint-only: a coauthor who
+ACCEPTS tracked changes in Word strips the w:ins/w:del runs, so the
+imported tracked paragraph has the new wording but no CriticMarkup -
+its fingerprint no longer matches canonical, and a fingerprint-only
+lookup falls back to canonical (losing the accepted edits).
+Two-pointer alignment keeps canonical and tracked in step paragraph
+by paragraph, lookahead handles inserted/deleted paragraphs on either
+side, and the positional fallback inside a matched run carries
+accepted edits through into the merge."
+  (let* ((nc (length canon-paras))
+         (nt (length tracked-paras))
+         (align (make-vector nc nil))
+         (tracked-vec (vconcat tracked-paras))
+         (canon-fp-vec (vconcat (mapcar #'otd--normalize-for-match canon-paras)))
+         (tracked-fp-vec (vconcat (mapcar #'otd--normalize-for-match tracked-paras)))
+         (i 0) (j 0))
+    (while (and (< i nc) (< j nt))
+      (let ((cfp (aref canon-fp-vec i))
+            (tfp (aref tracked-fp-vec j)))
+        (cond
+         ;; Exact fingerprint match: paragraphs correspond, advance both.
+         ((string= cfp tfp)
+          (aset align i (aref tracked-vec j))
+          (cl-incf i) (cl-incf j))
+         ;; Tracked has an extra paragraph (e.g. docx bibliography
+         ;; section); skip it without consuming a canonical paragraph.
+         ((and (< (1+ j) nt)
+               (string= cfp (aref tracked-fp-vec (1+ j))))
+          (cl-incf j))
+         ;; Canonical has an extra paragraph (deleted in tracked);
+         ;; leave it unaligned and advance.
+         ((and (< (1+ i) nc)
+               (string= (aref canon-fp-vec (1+ i)) tfp))
+          (cl-incf i))
+         ;; Both fingerprints differ and short lookahead found no
+         ;; structural insertion/deletion: assume they correspond and
+         ;; the tracked paragraph carries accepted edits.  Use tracked.
+         (t
+          (aset align i (aref tracked-vec j))
+          (cl-incf i) (cl-incf j)))))
+    align))
+
 (defun otd--merge-content (canonical tracked)
   "Return merged content combining CANONICAL (cite keys, metadata,
-property drawers, etc.) with CriticMarkup tokens from TRACKED.
+property drawers, etc.) with CriticMarkup tokens AND accepted edits
+from TRACKED.
 
-Walks CANONICAL line-by-line, preserving its full structure.  For each
-body paragraph it computes a normalized fingerprint; if a CriticMarkup-
-bearing paragraph in TRACKED has the same fingerprint, that tracked
-paragraph (with citation forms back-substituted to `[cite:@key]') takes
-the canonical paragraph's place.  After the walk, any remaining tracked
-comments whose canonical anchor was missed by paragraph fingerprinting
-are re-anchored by `otd--reanchor-comments' (substring splice for
-exactly-once matches).
+Walks CANONICAL line-by-line, preserving its full structure.  Body
+paragraphs are aligned to tracked paragraphs by positional + fingerprint
+alignment (see `otd--align-paragraphs'); the tracked text takes the
+canonical paragraph's place when the alignment is non-nil, with
+citation and cross-ref forms back-substituted to `[cite:@key]'.  After
+the walk, any tracked comments whose anchor was missed by paragraph
+alignment are re-anchored by `otd--reanchor-comments' (substring
+splice for exactly-once matches).
 
-Tracked paragraphs that match nothing in canonical (e.g. the docx
+Tracked paragraphs that align to no canonical paragraph (e.g. the docx
 bibliography section, which canonical does not contain because it is
 regenerated by citeproc on export) are dropped.
 
@@ -1352,10 +1509,18 @@ Returns (MERGED-STRING . PLIST) where PLIST has keys
 :merged-paragraphs, :cm-paragraphs, :cite-keys, :reanchored-comments."
   (let* ((cite-map (otd--build-cite-map canonical))
          (xref-map (otd--build-xref-map canonical))
-         (cm-map (cl-loop for p in (otd--split-paragraphs tracked)
-                          when (otd--has-criticmarkup-p p)
-                          collect (cons (otd--normalize-for-match p) p)))
+         (canon-paras (otd--split-paragraphs canonical))
+         (tracked-paras (otd--split-paragraphs tracked))
+         (canon-body-paras (cl-remove-if
+                            (lambda (p) (string-match-p "^\\*+[ \t]" p))
+                            canon-paras))
+         (tracked-body-paras (cl-remove-if
+                              (lambda (p) (string-match-p "^\\*+[ \t]" p))
+                              tracked-paras))
+         (align (otd--align-paragraphs canon-body-paras tracked-body-paras))
+         (n-cm-tracked (cl-count-if #'otd--has-criticmarkup-p tracked-body-paras))
          (n-merged 0)
+         (body-idx 0)
          (output nil)
          (current nil)
          (in-drawer nil)
@@ -1364,9 +1529,8 @@ Returns (MERGED-STRING . PLIST) where PLIST has keys
         ((flush ()
            (when current
              (let* ((para (mapconcat #'identity (nreverse current) "\n"))
-                    (fp (otd--normalize-for-match para))
-                    (replacement (and (not (string-empty-p fp))
-                                      (cdr (assoc fp cm-map)))))
+                    (replacement (and (< body-idx (length align))
+                                      (aref align body-idx))))
                (push (if replacement
                          (progn (cl-incf n-merged)
                                 (otd--substitute-xrefs
@@ -1374,7 +1538,8 @@ Returns (MERGED-STRING . PLIST) where PLIST has keys
                                                             cite-map)
                                  xref-map))
                        para)
-                     output))
+                     output)
+               (cl-incf body-idx))
              (setq current nil))))
       (dolist (line (split-string canonical "\n"))
         (cond
@@ -1398,7 +1563,7 @@ Returns (MERGED-STRING . PLIST) where PLIST has keys
            (re (otd--reanchor-comments merged-str tracked xref-map)))
       (cons (car re)
             (list :merged-paragraphs n-merged
-                  :cm-paragraphs (length cm-map)
+                  :cm-paragraphs n-cm-tracked
                   :cite-keys (length cite-map)
                   :reanchored-comments (cdr re))))))
 
@@ -1588,59 +1753,6 @@ and COUNTS is a plist of token counts."
       (while (search-forward (car pair) nil t)
         (replace-match (cdr pair) t t)))
     (write-region (point-min) (point-max) md-file nil 'silent)))
-
-;;;; --- auto-import on find-file ---------------------------------------
-
-(defcustom otd-auto-import-reuse t
-  "When non-nil, `otd-auto-import-mode' reuses an existing import.
-If the `otd-output-suffix' .org that `otd-import' produces for a docx
-already exists and is at least as new as the docx, opening the docx
-visits that .org instead of re-running pandoc -- which would overwrite
-any edits made in the imported file.  When the docx is newer than the
-existing .org (a freshly returned review), it is re-imported."
-  :type 'boolean :group 'org-tracked-docx)
-
-(defun otd--auto-import-target (docx)
-  "Return the .org path `otd-import' writes for DOCX (no conversion)."
-  (let ((dir  (file-name-directory (expand-file-name docx)))
-        (base (file-name-sans-extension (file-name-nondirectory docx))))
-    (expand-file-name (concat base otd-output-suffix ".org") dir)))
-
-(defun otd--auto-import-noselect (orig filename &rest args)
-  "Around-advice for `find-file-noselect': import docx via `otd-import'.
-When FILENAME is an existing `*.docx', convert it and return the buffer
-visiting the imported .org instead of a buffer of raw docx bytes.  Any
-error falls back to ORIG so the file still opens."
-  (let ((file (and (stringp filename) (expand-file-name filename))))
-    (if (and file
-             (string-match-p "\\.docx\\'" file)
-             (file-regular-p file))
-        (condition-case err
-            (let* ((out   (otd--auto-import-target file))
-                   (reuse (and otd-auto-import-reuse
-                               (file-exists-p out)
-                               (not (file-newer-than-file-p file out)))))
-              ;; `otd-import' already visits OUT; calling ORIG on it just
-              ;; returns that live buffer.  In the reuse branch ORIG opens
-              ;; the previously imported .org directly.
-              (apply orig (if reuse out (otd-import file)) args))
-          (error
-           (message "otd auto-import failed (%s); opening docx raw"
-                    (error-message-string err))
-           (apply orig filename args)))
-      (apply orig filename args))))
-
-;;;###autoload
-(define-minor-mode otd-auto-import-mode
-  "Global minor mode: opening a Word .docx auto-imports it with `otd-import'.
-When enabled, visiting any `*.docx' file (via \\[find-file], dired, a
-desktop restore, etc.) runs the tracked-changes import pipeline and
-shows the resulting CriticMarkup org buffer instead of raw binary.
-See `otd-auto-import-reuse' for re-import vs. reuse behaviour."
-  :global t :group 'org-tracked-docx
-  (if otd-auto-import-mode
-      (advice-add 'find-file-noselect :around #'otd--auto-import-noselect)
-    (advice-remove 'find-file-noselect #'otd--auto-import-noselect)))
 
 (provide 'org-tracked-docx)
 ;;; org-tracked-docx.el ends here
