@@ -119,8 +119,14 @@ Pipeline:
                                      "-o" md-tmp))))
               (unless (zerop exit)
                 (error "pandoc docx->md exit %s:\n%s" exit (buffer-string)))))
-          ;; Stage 2: rewrite pandoc spans to CriticMarkup
-          (let ((counts (otd--rewrite-spans md-tmp)))
+          ;; Stage 2: rewrite pandoc spans to CriticMarkup.  Pull the
+          ;; resolved (`done') comment ids out of the docx first so
+          ;; rewrite-spans can tag those with ` [DONE] ' after the
+          ;; author prefix.  Pandoc strips this signal, so we read
+          ;; the source xml directly.
+          (let* ((done-set (otd--extract-done-comment-ids
+                            (expand-file-name docx)))
+                 (counts (otd--rewrite-spans md-tmp done-set)))
             ;; Stage 2b: shield grid_tables (multi-line cells) with sentinels
             ;; so pandoc's md->org cannot collapse them into pipe-table rows.
             (setq grid-alist (otd--shield-grid-tables md-tmp))
@@ -134,10 +140,16 @@ Pipeline:
             ;; than a regex disable of the offending extensions, which would
             ;; also clobber legitimate inline super/subscript content.
             (let ((cm-alist (otd--stash-criticmarkup md-tmp)))
-              ;; Stage 3: markdown (with sentinels) -> org
+              ;; Stage 3: markdown (with sentinels) -> org.
+              ;; Disable `smart' (markdown-smart): without this pandoc
+              ;; rewrites straight `"' to curly Unicode `LEFT/RIGHT
+              ;; DOUBLE QUOTATION MARK' inside surviving attribute
+              ;; spans, leaving artifacts like `]{.comment-end id=U+201C
+              ;; 128 U+201D}' that the rewrite-spans pass can no longer
+              ;; recognize on a re-import.
               (with-temp-buffer
                 (let ((exit (apply #'call-process otd-pandoc-program nil t nil
-                                   (list "-f" "markdown" "-t" "org"
+                                   (list "-f" "markdown-smart" "-t" "org"
                                          "--wrap=none" md-tmp "-o" out))))
                   (unless (zerop exit)
                     (error "pandoc md->org exit %s:\n%s" exit (buffer-string)))))
@@ -168,7 +180,7 @@ Pipeline:
               (find-file out)
               (otd-criticmarkup-mode 1)
               (message
-               (concat "Imported %s -> %s  (++%d --%d ~~%d ==%d >>%d  grid:%d)"
+               (concat "Imported %s -> %s  (++%d --%d ~~%d ==%d >>%d ✓%d  grid:%d)"
                        (when embedded
                          (format "  source-found%s"
                                  (if merge-info
@@ -185,30 +197,115 @@ Pipeline:
                (file-name-nondirectory out)
                (plist-get counts :ins) (plist-get counts :del)
                (plist-get counts :sub) (plist-get counts :hi)
-               (plist-get counts :cmt) (length grid-alist)))))
+               (plist-get counts :cmt) (or (plist-get counts :done) 0)
+               (length grid-alist)))))
       (when (file-exists-p md-tmp)     (delete-file md-tmp))
       (when (file-exists-p docx-fixed) (delete-file docx-fixed)))
     out))
 
-(defun otd--rewrite-spans (md-file)
+(defun otd--extract-done-comment-ids (docx-path)
+  "Return a hash table (string -> t) of comment ids resolved (`done')
+in DOCX-PATH's Word reviewing pane.
+
+Word stores the per-paragraph resolved state in `word/commentsExtended.xml'
+as `<w15:commentEx w15:paraId=... w15:done=\"1\"/>'.  Each `paraId' refers
+to a `w14:paraId' attribute on a `<w:p>' inside `word/comments.xml',
+where a single comment may carry several paragraphs (top-level + replies).
+This walker treats a comment as resolved when ANY of its paragraphs is
+marked done, matching Word's UI behavior where clicking `Resolve' on
+the conversation flips every reply to done together.
+
+Returns an empty hash table if either XML part is missing (Word versions
+< 2013 do not write `commentsExtended.xml')."
+  (let ((done (make-hash-table :test 'equal))
+        (tmpdir (make-temp-file "otd-done-" t)))
+    (unwind-protect
+        (when (zerop (call-process
+                      "unzip" nil nil nil "-qo" docx-path
+                      "word/comments.xml" "word/commentsExtended.xml"
+                      "-d" tmpdir))
+          (let ((paraid-done (make-hash-table :test 'equal))
+                (ext (expand-file-name "word/commentsExtended.xml" tmpdir))
+                (com (expand-file-name "word/comments.xml" tmpdir)))
+            ;; paraId -> done flag
+            (when (file-exists-p ext)
+              (with-temp-buffer
+                (insert-file-contents ext)
+                (goto-char (point-min))
+                (while (re-search-forward
+                        "<w15:commentEx\\(?:[[:space:]][^>]*\\)?[[:space:]]w15:paraId=\"\\([0-9A-Fa-f]+\\)\"\\(?:[[:space:]][^>]*\\)?[[:space:]]w15:done=\"\\([01]\\)\""
+                        nil t)
+                  (when (string= (match-string 2) "1")
+                    (puthash (upcase (match-string 1)) t paraid-done)))))
+            ;; Walk comments.xml: any <w:p w14:paraId="X"> inside a
+            ;; <w:comment w:id="N"> flagged done => N is done.
+            (when (and (file-exists-p com) (> (hash-table-count paraid-done) 0))
+              (with-temp-buffer
+                (insert-file-contents com)
+                (goto-char (point-min))
+                (let (cur-id)
+                  (while (re-search-forward
+                          "<w:comment[[:space:]][^>]*w:id=\"\\([0-9]+\\)\"\\|<w:p[[:space:]][^>]*w14:paraId=\"\\([0-9A-Fa-f]+\\)\""
+                          nil t)
+                    (cond
+                     ((match-string 1) (setq cur-id (match-string 1)))
+                     ((and cur-id
+                           (gethash (upcase (match-string 2)) paraid-done))
+                      (puthash cur-id t done)))))))))
+      (delete-directory tmpdir t))
+    done))
+
+(defun otd--rewrite-spans (md-file &optional done-set)
   "Rewrite pandoc track-change/comment spans in MD-FILE to CriticMarkup.
+When DONE-SET (a hash table mapping comment-id strings to t) lists a
+comment as resolved in Word, prefix the emitted comment text with
+`[DONE] ' after the author tag, so the round-trip is:
+
+  Word `done=1' (.docx)  ->  {>>[Author] [DONE] text<<} (.org)
+
 Return a plist with counts of each marker emitted."
-  (let ((n-ins 0) (n-del 0) (n-sub 0) (n-hi 0) (n-cmt 0))
+  (let ((n-ins 0) (n-del 0) (n-sub 0) (n-hi 0) (n-cmt 0) (n-done 0))
     (with-temp-buffer
       (insert-file-contents md-file)
-      ;; Pre-pass: flatten pandoc's nested closing spans for overlapping
+      ;; Pre-pass 0: downgrade `# Lead paragraph...' lines that pandoc's
+      ;; docx reader misclassified as ATX headings.  When the docx's
+      ;; first body paragraph (e.g. the Abstract opener) carries a
+      ;; heading-like style, pandoc emits it as `# <300-char paragraph>'
+      ;; which would otherwise become a section heading on md->org and
+      ;; eat the abstract body entirely.  Heuristic: strip CriticMarkup
+      ;; attribute spans (`[text]{.attr=...}', `[]{.attr...}'), then if
+      ;; what remains exceeds 80 chars of running prose treat it as a
+      ;; misclassified paragraph and remove the leading `# '.  This keeps
+      ;; genuinely short headings (`# Abstract', `# Results') intact
+      ;; even when they carry inline reviewer comments.
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^#[[:space:]]+\\(.+\\)$" nil t)
+        (let* ((line (match-string 1))
+               ;; Strip attribute span tails like `]{.comment-end id="N"}',
+               ;; `]{.insertion author="..." date="..."}', `]{.mark}'.
+               (stripped
+                (replace-regexp-in-string
+                 "\\][[:space:]]*{\\.[A-Za-z0-9_-]+[^}]*}" "" line))
+               ;; Strip the leading `[' of any opener like `[CTEXT]{...}'.
+               (stripped (replace-regexp-in-string "\\[" "" stripped)))
+          (when (> (length (string-trim stripped)) 80)
+            (replace-match line t t))))
+      ;; Pre-pass 1: flatten pandoc's nested closing spans for overlapping
       ;; reviewer comments.  For two comments on the same range pandoc emits
-      ;; `[[]{.comment-end id="INNER"}]{.comment-end id="OUTER"}'; this turns
-      ;; it into `[]{.comment-end id="INNER"}[]{.comment-end id="OUTER"}'
-      ;; (two adjacent simple closings), so the main pattern below matches
-      ;; both.  Loop to flatten arbitrary nesting depth.
+      ;; `[[]{.comment-end id="INNER"}]{.comment-end id="OUTER"}'; for three
+      ;; (which does happen on heavily-reviewed paragraphs) it emits
+      ;; `[[[]{end:130}]{end:129}]{end:128}'.  The pattern below accepts one
+      ;; OR MORE inner empty `[]{.comment-end id="N"}' spans between the
+      ;; outer brackets, so each iteration peels one wrapping layer
+      ;; regardless of depth; the loop runs until no nested form remains.
       (goto-char (point-min))
       (let ((flat t))
         (while flat
           (setq flat nil)
           (goto-char (point-min))
           (while (re-search-forward
-                  "\\[\\(\\[\\]{\\.comment-end[[:space:]]+id=\"[0-9]+\"}\\)\\]\\({\\.comment-end[[:space:]]+id=\"[0-9]+\"}\\)"
+                  "\\[\\(\\(?:\\[\\]{\\.comment-end[[:space:]]+id=\"[0-9]+\"}\\)+\\)\\]\\({\\.comment-end[[:space:]]+id=\"[0-9]+\"}\\)"
                   nil t)
             (replace-match "\\1[]\\2" t)
             (setq flat t))))
@@ -248,7 +345,8 @@ Return a plist with counts of each marker emitted."
                           (setq best-dist dist
                                 best (list start (match-end 0)
                                            ctext author after
-                                           (match-beginning 0))))))))))
+                                           (match-beginning 0)
+                                           id))))))))) ; carry id into outer scope
             (when best
               (setq more t)
               (let* ((start-pos   (nth 0 best))
@@ -257,14 +355,27 @@ Return a plist with counts of each marker emitted."
                      (author      (nth 3 best))
                      (range-start (nth 4 best))
                      (range-end   (nth 5 best))
+                     (id          (nth 6 best))
                      (range-text  (buffer-substring-no-properties
                                    range-start range-end))
                      ;; Encode docx author into the CriticMarkup comment text as
                      ;; `[Author Name] …' prefix, so `otd-export' can round-trip
                      ;; authorship back into Word's `<w:comment w:author="…">'.
-                     (ctext-tagged (if (and author (not (string-empty-p author)))
-                                       (format "[%s] %s" author ctext)
-                                     ctext)))
+                     ;; When the docx flagged this comment as resolved in
+                     ;; Word's reviewing pane, inject ` [DONE]' immediately
+                     ;; after the author tag.  Reading: `[Author] [DONE] body'.
+                     (resolved (and done-set (gethash id done-set)))
+                     (ctext-tagged
+                      (cond
+                       ((and author (not (string-empty-p author)) resolved)
+                        (cl-incf n-done)
+                        (format "[%s] [DONE] %s" author ctext))
+                       ((and author (not (string-empty-p author)))
+                        (format "[%s] %s" author ctext))
+                       (resolved
+                        (cl-incf n-done)
+                        (format "[DONE] %s" ctext))
+                       (t ctext))))
                 (delete-region start-pos end-pos)
                 (goto-char start-pos)
                 (insert (format "{==%s==}{>>%s<<}" range-text ctext-tagged))
@@ -333,7 +444,7 @@ Return a plist with counts of each marker emitted."
               nil t)
         (replace-match "[]{\\1}" t))
       (write-file md-file))
-    (list :ins n-ins :del n-del :sub n-sub :hi n-hi :cmt n-cmt)))
+    (list :ins n-ins :del n-del :sub n-sub :hi n-hi :cmt n-cmt :done n-done)))
 
 (defun otd--count (re)
   "Count buffer-wide matches of RE."
@@ -609,7 +720,25 @@ so the marker attaches without visibly changing the text)."
     (while (re-search-forward
             (concat "\\([^[:alnum:][:space:]" zwsp "]\\)\\(\\^\\|_\\){")
             nil t)
-      (replace-match (concat "\\1" zwsp "\\2{")))))
+      (replace-match (concat "\\1" zwsp "\\2{"))))
+  ;; Drop pandoc-emitted definition-list duplicate captions for
+  ;; pandoc-crossref targets.  When a docx that was originally exported
+  ;; with `[cite:@fig:LABEL]' references is re-imported, pandoc's
+  ;; org writer emits the rendered caption as a `term : definition'
+  ;; pair right after the real `#+name: / #+caption:` block, e.g.:
+  ;;
+  ;;     [cite:@fig:rmzrdz]: Within-pair MZ and DZ correlations...
+  ;;
+  ;; These duplicate captions are NOT picked up by pandoc-crossref on
+  ;; the next export and otherwise sit alongside the real figure
+  ;; caption as orphaned prose, often misattributing one figure's
+  ;; caption to the next figure block.  Remove every such line
+  ;; (single- or multi-paragraph) emitted at column 0.
+  (goto-char (point-min))
+  (while (re-search-forward
+          "^\\[cite:@\\(?:fig\\|tbl\\|sec\\|eq\\|lst\\):[A-Za-z][A-Za-z0-9_:.-]*\\]:[ \t].*\\(?:\n[^\n[:space:]].*\\)*\n*"
+          nil t)
+    (replace-match "" t t)))
 
 (defun otd--postfix-org (org-file)
   "Apply `otd--postfix-fixups' to ORG-FILE on disk."
@@ -659,14 +788,77 @@ existed so a re-export to docx preserves super/subscripts."
     ("{==[^=]*==}"                                      0 'otd-highlight  prepend))
   "Font-lock keywords for CriticMarkup tokens.")
 
+(defvar otd-criticmarkup-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "M-n")   #'otd-cm-next)
+    (define-key m (kbd "M-p")   #'otd-cm-prev)
+    (define-key m (kbd "C-c a") #'otd-cm-accept-at-point)
+    (define-key m (kbd "C-c r") #'otd-cm-reject-at-point)
+    (define-key m (kbd "C-c d") #'otd-cm-mark-done-at-point)
+    (define-key m (kbd "C-c D") #'otd-cm-unmark-done-at-point)
+    (define-key m (kbd "C-c A") #'otd-accept-all)
+    (define-key m (kbd "C-c R") #'otd-reject-all)
+    (define-key m (kbd "C-c X") #'otd-cm-remove-done)
+    m)
+  "Keymap for `otd-criticmarkup-mode'.")
+
+(defun otd--cm-header-button (label tip cmd)
+  "Return a mouse-clickable LABEL for the CriticMarkup header line.
+TIP is shown as tooltip and CMD is the command bound to mouse-1."
+  (let ((map (make-sparse-keymap)))
+    (define-key map [header-line mouse-1]
+      (lambda () (interactive)
+        (with-current-buffer (window-buffer (selected-window))
+          (call-interactively cmd))))
+    (propertize (format " %s " label)
+                'mouse-face 'mode-line-highlight
+                'help-echo tip
+                'local-map map)))
+
+(defvar otd--cm-header-line-format
+  '(:eval
+    (concat
+     (otd--cm-header-button "◀"    "Previous CriticMarkup (M-p)"      #'otd-cm-prev)
+     (otd--cm-header-button "▶"    "Next CriticMarkup (M-n)"          #'otd-cm-next)
+     "│"
+     (otd--cm-header-button "✓"    "Accept at point (C-c a)"          #'otd-cm-accept-at-point)
+     (otd--cm-header-button "✗"    "Reject at point (C-c r)"          #'otd-cm-reject-at-point)
+     "│"
+     (otd--cm-header-button "✓✓"   "Accept ALL (C-c A)"               #'otd-accept-all)
+     (otd--cm-header-button "✗✗"   "Reject ALL (C-c R)"               #'otd-reject-all)
+     "│"
+     (otd--cm-header-button "done" "Mark comment DONE (C-c d)"        #'otd-cm-mark-done-at-point)
+     (otd--cm-header-button "undo done" "Unmark DONE (C-c D)"         #'otd-cm-unmark-done-at-point)
+     (otd--cm-header-button "🗑 done" "Remove all DONE comments (C-c X)" #'otd-cm-remove-done)))
+  "Header-line spec used while `otd-criticmarkup-mode' is on.")
+
 ;;;###autoload
 (define-minor-mode otd-criticmarkup-mode
-  "Minor mode that fontifies CriticMarkup tokens.
-Use \\[otd-accept-all] / \\[otd-reject-all] to flatten changes."
+  "Minor mode that fontifies CriticMarkup tokens and exposes a
+review toolbar in the header line.
+
+\\{otd-criticmarkup-mode-map}
+
+The header-line buttons mirror the keymap commands:
+  ◀ / ▶          `otd-cm-prev'/`otd-cm-next'      (M-p / M-n)
+  ✓ / ✗          `otd-cm-accept-at-point' / `otd-cm-reject-at-point' (C-c a / C-c r)
+  ✓✓ / ✗✗        `otd-accept-all' / `otd-reject-all'  (C-c A / C-c R)
+  done / undo    `otd-cm-mark-done-at-point' / `otd-cm-unmark-done-at-point' (C-c d / C-c D)
+  🗑 done        `otd-cm-remove-done'                (C-c X)"
   :lighter " CM"
-  (if otd-criticmarkup-mode
-      (font-lock-add-keywords nil otd--keywords 'append)
-    (font-lock-remove-keywords nil otd--keywords))
+  :keymap otd-criticmarkup-mode-map
+  (cond
+   (otd-criticmarkup-mode
+    (font-lock-add-keywords nil otd--keywords 'append)
+    ;; Stash the user's previous header-line so we can restore on disable.
+    (setq-local otd--cm-saved-header-line header-line-format)
+    (setq header-line-format otd--cm-header-line-format))
+   (t
+    (font-lock-remove-keywords nil otd--keywords)
+    (setq header-line-format
+          (and (boundp 'otd--cm-saved-header-line)
+               otd--cm-saved-header-line))
+    (kill-local-variable 'otd--cm-saved-header-line)))
   (font-lock-flush))
 
 ;;;; --- accept / reject -------------------------------------------------
@@ -699,6 +891,271 @@ value, comments are dropped, highlights are kept as plain text."
   (otd--replace "{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}"            "\\1")
   (otd--replace "{>>[^{}<]*<<}"                                   "")
   (otd--replace "{==\\([^=]*\\)==}"                               "\\1"))
+
+;;;; --- review workflow: navigate, accept/reject at point, manage done -
+
+(defconst otd--cm-token-re
+  ;; Matches any single CriticMarkup token.  Group 1 captures the
+  ;; opening sentinel so callers know which kind.  Order matters in
+  ;; the alternation because `{==' would otherwise be eaten by the
+  ;; earlier `{--' alternative on a string like `{==}'.
+  (concat
+   "\\("
+   "{\\+\\+\\(?:\\[[^]]+\\]\\)?[^{}]*?\\+\\+}"      ; insertion
+   "\\|{--\\(?:\\[[^]]+\\]\\)?[^{}]*?--}"            ; deletion
+   "\\|{~~[^~{}]*?~>[^~{}]*?~~}"                     ; substitution
+   "\\|{==[^=]*==}"                                  ; highlight
+   "\\|{>>[^{}<]*<<}"                                ; comment
+   "\\)")
+  "Single-pass regex matching any one CriticMarkup token.")
+
+(defun otd--cm-token-kind (text)
+  "Return one of the symbols `ins', `del', `sub', `hi', `cmt'
+describing the CriticMarkup TEXT, or nil if TEXT is not a token."
+  (cond
+   ((string-prefix-p "{++" text) 'ins)
+   ((string-prefix-p "{--" text) 'del)
+   ((string-prefix-p "{~~" text) 'sub)
+   ((string-prefix-p "{==" text) 'hi)
+   ((string-prefix-p "{>>" text) 'cmt)))
+
+(defun otd--cm-token-at-point ()
+  "Return (KIND BEG END TEXT) for the CriticMarkup token containing
+point or, if point is between tokens, the next one on the same line.
+Return nil when no token is reachable on the current line.
+
+A `hi' token that is immediately followed by one or more `cmt'
+tokens is returned as the whole `{==..==}{>>..<<}...' run; that
+matches what users perceive as a single reviewer comment.
+
+Walks the line left-to-right rather than searching backward from
+EOL, because a line can carry many tokens and only one of them
+contains point."
+  (save-excursion
+    (let* ((orig (point))
+           (bol (line-beginning-position))
+           (eol (line-end-position))
+           (hit nil))
+      (goto-char bol)
+      (while (and (not hit)
+                  (re-search-forward otd--cm-token-re eol t))
+        (let ((beg (match-beginning 0))
+              (end (match-end 0)))
+          ;; Extend `hi' across any trailing comment chain so accept/
+          ;; reject treats `{==X==}{>>cmt<<}' as one logical edit.
+          (when (eq (otd--cm-token-kind
+                     (buffer-substring-no-properties beg end))
+                    'hi)
+            (goto-char end)
+            (while (looking-at "{>>[^{}<]*<<}")
+              (setq end (match-end 0))
+              (goto-char end)))
+          (cond
+           ;; Point is inside this token (or right at its closer).
+           ((and (<= beg orig) (<= orig end))
+            (setq hit (list beg end)))
+           ;; Point is BEFORE this token: it's the next-on-line.
+           ((< orig beg)
+            (setq hit (list beg end))))
+          (goto-char end)))
+      (when hit
+        (let* ((beg  (nth 0 hit))
+               (end  (nth 1 hit))
+               (text (buffer-substring-no-properties beg end)))
+          (list (otd--cm-token-kind text) beg end text))))))
+
+;;;###autoload
+(defun otd-cm-next ()
+  "Move point to the next CriticMarkup token in the buffer."
+  (interactive)
+  (let ((start (point)))
+    ;; Skip past the token at point so we move forward predictably.
+    (when (looking-at otd--cm-token-re)
+      (goto-char (match-end 0)))
+    (if (re-search-forward otd--cm-token-re nil t)
+        (goto-char (match-beginning 0))
+      (goto-char start)
+      (message "otd-cm-next: no more CriticMarkup tokens"))))
+
+;;;###autoload
+(defun otd-cm-prev ()
+  "Move point to the previous CriticMarkup token in the buffer."
+  (interactive)
+  (let ((start (point)))
+    (if (re-search-backward otd--cm-token-re nil t)
+        nil   ; point is already at match-beginning
+      (goto-char start)
+      (message "otd-cm-prev: no previous CriticMarkup tokens"))))
+
+(defun otd--cm-apply (action)
+  "Apply ACTION (`accept' or `reject') to the CriticMarkup token at point.
+
+`accept' takes coauthor edits as proposed (keep insertions, drop
+deletions, take the new side of substitutions, strip highlight
+markers, drop comments).  `reject' reverts (drop insertions, keep
+deletions, take the old side of substitutions, strip highlight
+markers, drop comments)."
+  (let ((tok (otd--cm-token-at-point)))
+    (unless tok (user-error "No CriticMarkup token at point"))
+    (let* ((kind (nth 0 tok))
+           (beg  (nth 1 tok))
+           (end  (nth 2 tok))
+           (text (nth 3 tok))
+           (new
+            (pcase (cons kind action)
+              (`(ins . accept)
+               (and (string-match
+                     "\\`{\\+\\+\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)\\+\\+}\\'"
+                     text)
+                    (match-string 1 text)))
+              (`(ins . reject) "")
+              (`(del . accept) "")
+              (`(del . reject)
+               (and (string-match
+                     "\\`{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}\\'"
+                     text)
+                    (match-string 1 text)))
+              (`(sub . accept)
+               (and (string-match
+                     "\\`{~~[^~{}]*?~>\\([^~{}]*?\\)~~}\\'" text)
+                    (match-string 1 text)))
+              (`(sub . reject)
+               (and (string-match
+                     "\\`{~~\\([^~{}]*?\\)~>[^~{}]*?~~}\\'" text)
+                    (match-string 1 text)))
+              ((or `(hi . accept) `(hi . reject))
+               ;; Strip the `{==...==}' wrapper and drop every trailing
+               ;; `{>>..<<}' so the visible prose is what remains.
+               (when (string-match
+                      "\\`{==\\([^=]*\\)==}\\(?:{>>[^{}<]*<<}\\)*\\'" text)
+                 (match-string 1 text)))
+              ((or `(cmt . accept) `(cmt . reject)) ""))))
+      (unless new
+        (user-error "Could not parse %s token" kind))
+      (save-excursion
+        (goto-char beg)
+        (delete-region beg end)
+        (insert new))
+      (goto-char beg))))
+
+;;;###autoload
+(defun otd-cm-accept-at-point ()
+  "Accept the CriticMarkup change at point."
+  (interactive)
+  (otd--cm-apply 'accept))
+
+;;;###autoload
+(defun otd-cm-reject-at-point ()
+  "Reject the CriticMarkup change at point."
+  (interactive)
+  (otd--cm-apply 'reject))
+
+(defun otd--cm-comment-at-point ()
+  "Return (BEG END BODY DONE-P) for the `{>>..<<}' comment containing
+point.  Walks the line forward so a line carrying multiple
+stacked comments resolves to the one actually under point."
+  (save-excursion
+    (let ((orig (point))
+          (bol (line-beginning-position))
+          (eol (line-end-position))
+          (hit nil))
+      (goto-char bol)
+      (while (and (not hit)
+                  (re-search-forward "{>>\\([^{}<]*\\)<<}" eol t))
+        (let ((beg  (match-beginning 0))
+              (end  (match-end 0))
+              (body (match-string 1)))
+          (when (and (<= beg orig) (<= orig end))
+            (setq hit (list beg end body
+                            (and (string-match-p
+                                  "\\`\\(\\[[^]]+\\][[:space:]]+\\)?\\[DONE\\]"
+                                  body)
+                                 t))))))
+      hit)))
+
+;;;###autoload
+(defun otd-cm-mark-done-at-point ()
+  "Mark the comment at point as resolved by inserting `[DONE]'
+immediately after the author tag (or at the start when no author).
+No-op if the comment already carries `[DONE]'."
+  (interactive)
+  (let ((c (otd--cm-comment-at-point)))
+    (unless c (user-error "No reviewer comment at point"))
+    (when (nth 3 c)
+      (user-error "Comment is already marked DONE"))
+    (let* ((beg  (nth 0 c))
+           (body (nth 2 c))
+           (new-body
+            (cond
+             ((string-match "\\`\\(\\[[^]]+\\]\\)[[:space:]]+\\(.*\\)\\'" body)
+              (format "%s [DONE] %s"
+                      (match-string 1 body) (match-string 2 body)))
+             (t (concat "[DONE] " body)))))
+      (save-excursion
+        (goto-char beg)
+        (delete-region beg (nth 1 c))
+        (insert (format "{>>%s<<}" new-body)))
+      (message "Marked DONE: %s" (or (string-trim new-body) "")))))
+
+;;;###autoload
+(defun otd-cm-unmark-done-at-point ()
+  "Remove the `[DONE]' marker from the comment at point."
+  (interactive)
+  (let ((c (otd--cm-comment-at-point)))
+    (unless c (user-error "No reviewer comment at point"))
+    (unless (nth 3 c) (user-error "Comment is not marked DONE"))
+    (let* ((beg  (nth 0 c))
+           (end  (nth 1 c))
+           (body (nth 2 c))
+           (new (replace-regexp-in-string
+                 "\\(\\[[^]]+\\][[:space:]]+\\)?\\[DONE\\][[:space:]]*"
+                 (lambda (m)
+                   (if (string-match "\\`\\(\\[[^]]+\\]\\)" m)
+                       (concat (match-string 1 m) " ")
+                     ""))
+                 body t)))
+      (save-excursion
+        (goto-char beg)
+        (delete-region beg end)
+        (insert (format "{>>%s<<}" new))))))
+
+;;;###autoload
+(defun otd-cm-remove-done ()
+  "Delete every comment that carries the `[DONE]' marker.
+
+An orphan highlight (`{==text==}' with no remaining `{>>..<<}'
+attached) has its markers stripped so the visible prose stays
+intact; otherwise other reviewers' comments in the same stack
+are preserved."
+  (interactive)
+  (let ((removed 0)
+        (orphans 0))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward
+              "{>>\\(\\[[^]]+\\][[:space:]]+\\)?\\[DONE\\][^<]*<<}"
+              nil t)
+        (replace-match "" t t)
+        (cl-incf removed)))
+    ;; Clean up highlights that now stand alone (no `{>>..<<}' chain).
+    ;; Emacs regex has no `(?!...)' lookahead, so check by hand.
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "{==\\([^=]*\\)==}" nil t)
+        (let ((beg (match-beginning 0))
+              (end (match-end 0))
+              (inner (match-string 1)))
+          (unless (looking-at "{>>")
+            (delete-region beg end)
+            (goto-char beg)
+            (insert inner)
+            (cl-incf orphans)))))
+    (message "otd-cm-remove-done: removed %d comment%s%s"
+             removed (if (= removed 1) "" "s")
+             (if (> orphans 0)
+                 (format ", stripped %d orphan highlight%s"
+                         orphans (if (= orphans 1) "" "s"))
+               ""))))
 
 ;;;; --- compare against canonical org -----------------------------------
 
@@ -1046,11 +1503,35 @@ first occurrence, mirroring pandoc-citeproc's numbering."
 
 (defun otd--substitute-cite-keys (text cite-map)
   "Convert lossy citation forms in TEXT back to canonical `[cite:@key]'.
-Handles all three forms pandoc emits when reading docx and writing org:
+Handles every form pandoc emits when reading docx and writing org:
 - citeproc-anchored: `[[#citeproc_bib_item_N][N]]' (uses CITE-MAP for N->key)
 - pandoc-org reconstruction: `[[cite/t:@key]]' / `[[cite:@key]]'
-- bare: `[@key]'"
-  (let ((s text))
+- bare: `[@key]'
+- Vancouver-style numeric superscript: `^{N}', `^{N,M}', `^{N--M}',
+  `^{N-M}', mixed `^{1,2,5--7}'.  The numeric form is what citeproc
+  produces for numbered styles (e.g. Nature, Vancouver) and is the
+  default body-of-text form on a docx round-trip; without this branch
+  every cite collapses to a bare `^{N}' and the next export ships
+  just `1.', `2.', etc. with no keys."
+  (let ((s text)
+        ;; Reverse map: position N (string) -> key, for the numeric-
+        ;; superscript pass.  EXCLUDE pandoc-crossref cross-refs
+        ;; (`fig:LABEL', `tbl:LABEL', `sec:LABEL', `eq:LABEL',
+        ;; `lst:LABEL') because citeproc numbers only bibliographic
+        ;; references; cross-refs are numbered separately by
+        ;; pandoc-crossref ("Figure 1", "Table 2", ...) and get
+        ;; round-tripped by `otd--substitute-xrefs'.  Renumber the
+        ;; remaining keys 1..N so the reverse map matches the
+        ;; citeproc-rendered superscripts in the docx body.
+        (n->key (let ((h (make-hash-table :test 'equal))
+                      (n 0))
+                  (dolist (e cite-map h)
+                    (let ((key (car e)))
+                      (unless (string-match-p
+                               "\\`\\(?:fig\\|tbl\\|sec\\|eq\\|lst\\):"
+                               key)
+                        (cl-incf n)
+                        (puthash (number-to-string n) key h)))))))
     (dolist (entry cite-map)
       (let* ((key (car entry))
              (n   (cdr entry))
@@ -1060,6 +1541,42 @@ Handles all three forms pandoc emits when reading docx and writing org:
     (setq s (replace-regexp-in-string
              "\\[\\[cite\\(?:/[a-z]+\\)?:\\([^]]+\\)\\]\\]"
              "[cite:\\1]" s t))
+    ;; Numeric superscript form: `^{N}', `^{N,M}', `^{N--M}'.  Org
+    ;; uses U+2013 (EN DASH) for ranges via pandoc's `--' shortcut,
+    ;; but the raw ASCII `--' also occurs.  The character class
+    ;; accepts both.  `save-match-data' is mandatory because the
+    ;; inner `string-match'/`split-string' calls clobber the outer
+    ;; regex's match data, which `replace-regexp-in-string' relies
+    ;; on after the function returns -- without it, only the first
+    ;; number in each superscript is consumed.
+    (setq s
+          (replace-regexp-in-string
+           "\\^{\\([0-9,;[:space:]–-]+\\)}"
+           (lambda (m)
+             (save-match-data
+               (let* ((body (substring m 2 (1- (length m))))
+                      (nums nil))
+                 (dolist (chunk (split-string body "[,;[:space:]]+" t))
+                   (cond
+                    ((string-match
+                      "\\`\\([0-9]+\\)[–-]\\{1,2\\}\\([0-9]+\\)\\'"
+                      chunk)
+                     (let ((a (string-to-number (match-string 1 chunk)))
+                           (b (string-to-number (match-string 2 chunk))))
+                       (when (> a b) (cl-rotatef a b))
+                       (dotimes (i (1+ (- b a)))
+                         (push (number-to-string (+ a i)) nums))))
+                    ((string-match-p "\\`[0-9]+\\'" chunk)
+                     (push chunk nums))))
+                 (let ((keys (delq nil
+                                   (mapcar (lambda (n) (gethash n n->key))
+                                           (nreverse nums)))))
+                   (if keys
+                       (concat "[cite:"
+                               (mapconcat (lambda (k) (concat "@" k)) keys ";")
+                               "]")
+                     m)))))
+           s t))
     (setq s (replace-regexp-in-string
              "\\[\\(@[A-Za-z0-9_;,@[:space:]-]+\\)\\]"
              "[cite:\\1]" s t))
@@ -1168,9 +1685,18 @@ lossy versions and would otherwise prevent paragraph-level alignment)."
        ((and in-drawer (string-match-p "^[ \t]*:END:[ \t]*$" line))
         (setq in-drawer nil))
        (in-drawer)
-       ((string-match-p "^#\\+BEGIN_EXPORT" line)
+       ;; Org keywords are case-insensitive: `#+BEGIN_EXPORT' and
+       ;; `#+begin_export' are equivalent.  Pandoc's org writer emits
+       ;; lowercase, so a case-sensitive match on the uppercase form
+       ;; missed the canonical's frontmatter export block entirely and
+       ;; surfaced the author/affiliation lines as `body paragraphs',
+       ;; which then misaligned every following paragraph by ~6.
+       ((let ((case-fold-search t))
+          (string-match-p "^#\\+BEGIN_EXPORT" line))
         (setq in-export t))
-       ((and in-export (string-match-p "^#\\+END_EXPORT" line))
+       ((and in-export
+             (let ((case-fold-search t))
+               (string-match-p "^#\\+END_EXPORT" line)))
         (setq in-export nil))
        (in-export)
        ((string-match-p "^#\\+" line))     ;; skip keyword lines
@@ -1460,31 +1986,64 @@ accepted edits through into the merge."
          (tracked-vec (vconcat tracked-paras))
          (canon-fp-vec (vconcat (mapcar #'otd--normalize-for-match canon-paras)))
          (tracked-fp-vec (vconcat (mapcar #'otd--normalize-for-match tracked-paras)))
+         ;; Lookahead window: how far we will scan ahead on either side
+         ;; to find a matching fingerprint before falling back to a
+         ;; positional assumption.  Default 12 covers the common pain
+         ;; point where pandoc unwraps a frontmatter author block into
+         ;; ~6 separate paragraphs that the canonical (org source) keeps
+         ;; in a single `#+begin_export ... #+end_export' block; without
+         ;; the wide lookahead those extra tracked paragraphs would
+         ;; drift the abstract body into the Results section.
+         (la 12)
          (i 0) (j 0))
-    (while (and (< i nc) (< j nt))
-      (let ((cfp (aref canon-fp-vec i))
-            (tfp (aref tracked-fp-vec j)))
-        (cond
-         ;; Exact fingerprint match: paragraphs correspond, advance both.
-         ((string= cfp tfp)
-          (aset align i (aref tracked-vec j))
-          (cl-incf i) (cl-incf j))
-         ;; Tracked has an extra paragraph (e.g. docx bibliography
-         ;; section); skip it without consuming a canonical paragraph.
-         ((and (< (1+ j) nt)
-               (string= cfp (aref tracked-fp-vec (1+ j))))
-          (cl-incf j))
-         ;; Canonical has an extra paragraph (deleted in tracked);
-         ;; leave it unaligned and advance.
-         ((and (< (1+ i) nc)
-               (string= (aref canon-fp-vec (1+ i)) tfp))
-          (cl-incf i))
-         ;; Both fingerprints differ and short lookahead found no
-         ;; structural insertion/deletion: assume they correspond and
-         ;; the tracked paragraph carries accepted edits.  Use tracked.
-         (t
-          (aset align i (aref tracked-vec j))
-          (cl-incf i) (cl-incf j)))))
+    (cl-labels
+        ;; Prefix-equality on normalized fingerprints, not strict
+        ;; equality.  Coauthors who accepted a single edit (e.g. one
+        ;; letter `characterising' -> `characterizing') would otherwise
+        ;; produce a fingerprint mismatch on every match attempt, so
+        ;; the alignment falls back to the positional case and the
+        ;; abstract body lands wherever the author block sat in the
+        ;; tracked sequence.  40 chars is enough prose to be unique
+        ;; across all body paragraphs in a typical manuscript yet
+        ;; tolerates the long tail of small edits Chandra usually makes.
+        ((fp= (a b)
+           (let* ((pref 40)
+                  (na (length a)) (nb (length b))
+                  (mn (min pref na nb)))
+             (and (>= mn 8)
+                  (string= (substring a 0 mn)
+                           (substring b 0 mn)))))
+         (scan (vec start fp end)
+           (let ((k start) (found nil))
+             (while (and (not found) (< k end))
+               (when (fp= (aref vec k) fp) (setq found k))
+               (cl-incf k))
+             found)))
+      (while (and (< i nc) (< j nt))
+        (let* ((cfp (aref canon-fp-vec i))
+               (tfp (aref tracked-fp-vec j))
+               (la-end-t (min nt (+ j la)))
+               (la-end-c (min nc (+ i la))))
+          (cond
+           ;; Prefix-equality match: paragraphs correspond, advance.
+           ((fp= cfp tfp)
+            (aset align i (aref tracked-vec j))
+            (cl-incf i) (cl-incf j))
+           ;; Tracked has extra paragraphs (unwrapped frontmatter,
+           ;; bibliography section, etc.): scan ahead for the canonical
+           ;; fingerprint and skip the gap.
+           ((scan tracked-fp-vec (1+ j) cfp la-end-t)
+            (setq j (scan tracked-fp-vec (1+ j) cfp la-end-t)))
+           ;; Canonical has extra paragraphs (deleted in tracked): scan
+           ;; ahead in canonical for the tracked fingerprint.
+           ((scan canon-fp-vec (1+ i) tfp la-end-c)
+            (setq i (scan canon-fp-vec (1+ i) tfp la-end-c)))
+           ;; Neither side finds a match in window: assume they
+           ;; correspond and the tracked paragraph carries accepted
+           ;; edits.  Use tracked.
+           (t
+            (aset align i (aref tracked-vec j))
+            (cl-incf i) (cl-incf j))))))
     align))
 
 (defun otd--merge-content (canonical tracked)
@@ -1548,9 +2107,13 @@ Returns (MERGED-STRING . PLIST) where PLIST has keys
          ((and in-drawer (string-match-p "^[ \t]*:END:[ \t]*$" line))
           (setq in-drawer nil) (push line output))
          (in-drawer (push line output))
-         ((string-match-p "^#\\+BEGIN_EXPORT" line)
+         ;; Case-insensitive to match pandoc's lowercase `#+begin_export'.
+         ((let ((case-fold-search t))
+            (string-match-p "^#\\+BEGIN_EXPORT" line))
           (flush) (setq in-export t) (push line output))
-         ((and in-export (string-match-p "^#\\+END_EXPORT" line))
+         ((and in-export
+               (let ((case-fold-search t))
+                 (string-match-p "^#\\+END_EXPORT" line)))
           (setq in-export nil) (push line output))
          (in-export (push line output))
          ((or (string-match-p "^#\\+" line)
