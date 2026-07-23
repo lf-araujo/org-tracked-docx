@@ -1008,7 +1008,24 @@ comment's own coloring.")
 ;; optional [author]/[DONE] groups use `t' (laxmatch) since they don't
 ;; always participate in the match.
 (defvar otd--keywords
-  '(("\\({\\+\\+\\)\\(\\[[^]]+\\]\\)?\\([^{}]*?\\)\\(\\+\\+}\\)"
+  '(;; Guard against a false-positive collision with org's own `<<target>>'
+    ;; radio-link syntax.  A comment closes with `<<}' and the next one
+    ;; opens with `{>>'; since paragraphs in an `--wrap=none' export are
+    ;; long single lines, two comments sharing a paragraph put a bare
+    ;; `<<' ... `>>' pair around all the plain prose between them, which
+    ;; org(-modern) then reads as a radio target and fontifies (org-modern
+    ;; shrinks/dims it) -- the "text right after a comment looks smaller
+    ;; and gray" symptom.  This rule only matches OUR OWN literal `<<}'/
+    ;; `{>>' delimiter pair (not bare `<<'/`>>'), so it can't suppress an
+    ;; unrelated, genuine org radio target elsewhere in the document.
+    ;;
+    ;; It runs FIRST (lowest priority) and unconditionally defaults the
+    ;; whole span, including any highlight/insert/delete tokens nested
+    ;; inside it; the rules below run AFTER and prepend their own face
+    ;; for their own matched characters, so they still win over this
+    ;; blanket default wherever they overlap it.
+    ("<<}\\([^<>]*?\\){>>" (1 'default prepend))
+    ("\\({\\+\\+\\)\\(\\[[^]]+\\]\\)?\\([^{}]*?\\)\\(\\+\\+}\\)"
      (1 'otd-cm-marker prepend)
      (2 'otd-comment-author prepend t)
      (3 'otd-insert prepend)
@@ -1033,7 +1050,17 @@ comment's own coloring.")
     ("\\({==\\)\\([^=]*\\)\\(==}\\)"
      (1 'otd-cm-marker prepend)
      (2 'otd-highlight prepend)
-     (3 'otd-cm-marker prepend)))
+     (3 'otd-cm-marker prepend))
+    ;; Reassert `org-cite' on any `[cite:...]' unconditionally, as the
+    ;; last (highest-priority) rule.  A `[cite:@key]' that happens to
+    ;; fall inside the false `<<...>>' radio-target span above (see the
+    ;; neutralizer rule) loses its citation face entirely, not just its
+    ;; priority -- org's own citation fontification and the spurious
+    ;; org-modern radio-target rule are both part of org's *own* keyword
+    ;; pass, so whichever of THOSE two runs later wins before any of our
+    ;; rules even get a turn.  Reapplying `org-cite' here sidesteps that
+    ;; tug-of-war entirely rather than trying to referee it.
+    ("\\(\\[cite:[^][]*\\]\\)" (1 'org-cite prepend)))
   "Font-lock keywords for CriticMarkup tokens.")
 
 (defvar otd-criticmarkup-mode-map
