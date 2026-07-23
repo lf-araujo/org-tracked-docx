@@ -76,6 +76,92 @@ When nil or no embedded source is present, the lossy pandoc roundtrip
 is used as-is."
   :type 'boolean :group 'org-tracked-docx)
 
+(defcustom otd-fix-table-borders t
+  "When non-nil, `otd-export' rewrites every table's borders directly
+\(top + bottom rule, plus a rule under the header row; no vertical or
+inter-row lines) after pandoc generates the docx, via the
+`otd-table-borders-script' Python script, instead of relying solely on
+the reference-doc's \"Table\" table-style and its `firstRow' conditional
+formatting.
+
+Confirmed (by directly viewing the exported docx) to render more
+reliably than depending on the reference-doc's table-style borders
+alone, so this defaults on."
+  :type 'boolean :group 'org-tracked-docx)
+
+(defcustom otd-table-borders-script
+  (expand-file-name "otd-table-borders.py"
+                     (file-name-directory (or load-file-name buffer-file-name)))
+  "Path to the Python script `otd-export' runs (see `otd-fix-table-borders')
+to rewrite table borders directly in the generated docx."
+  :type 'string :group 'org-tracked-docx)
+
+(defcustom otd-python-program "python3"
+  "Python interpreter used to run `otd-table-borders-script'."
+  :type 'string :group 'org-tracked-docx)
+
+(defcustom otd-tangle-before-export t
+  "When non-nil, `otd-export' tangles embedded resource blocks first.
+
+A manuscript can embed its own bibliography, CSL style, and Word
+reference-doc as source blocks (see the \"Embedded resources\" section
+convention) instead of pointing `#+bibliography:'/`#+PANDOC_OPTIONS:'
+at external paths.  This makes the .org file fully self-contained and
+portable across machines: whatever is embedded in the document is
+always what gets used, with no dependency on any other file existing
+at some particular path on whatever machine runs the export.
+
+Plain-text resources (bibliography, CSL) use ordinary Org Babel
+`:tangle PATH' header args and are written via `org-babel-tangle-file'.
+Binary resources (e.g. a .docx reference template) cannot round-trip
+through a text buffer as raw bytes, so they use a custom `:tangle-binary
+PATH' header instead: the block body is expected to be base64 text,
+which `otd--tangle-binary-blocks' decodes and writes with no-conversion
+coding.  See `otd--tangle-embedded-resources'."
+  :type 'boolean :group 'org-tracked-docx)
+
+;;;; --- tangle embedded resources -----------------------------------------
+
+(defun otd--tangle-binary-blocks (org-file dir)
+  "Decode any `:tangle-binary PATH' source blocks in ORG-FILE to disk.
+
+Each such block's body must be base64 text (whitespace ignored); it is
+decoded and written as raw bytes to PATH, resolved relative to DIR.
+This is the binary-file counterpart to Org Babel's own `:tangle', which
+only ever writes its blocks out as text."
+  (with-temp-buffer
+    (insert-file-contents org-file)
+    (goto-char (point-min))
+    (while (re-search-forward
+            "^[ \t]*#\\+begin_src[ \t]+\\S-+.*:tangle-binary[ \t]+\\(\\S-+\\(?:[ \t]\\S-+\\)*?\\)\\(?:[ \t]:\\|[ \t]*$\\)"
+            nil t)
+      (let* ((target (expand-file-name (match-string 1) dir))
+             (body-start (progn (forward-line 1) (point)))
+             (body-end (progn
+                         (re-search-forward "^[ \t]*#\\+end_src" nil t)
+                         (match-beginning 0)))
+             (b64 (buffer-substring-no-properties body-start body-end))
+             (bytes (base64-decode-string (replace-regexp-in-string "[ \t\n\r]" "" b64))))
+        (make-directory (file-name-directory target) t)
+        (let ((coding-system-for-write 'no-conversion))
+          (write-region bytes nil target nil 'silent))
+        (message "otd: tangled binary resource -> %s" target)))))
+
+(defun otd--tangle-embedded-resources (org-file dir)
+  "Regenerate any embedded-resource files ORG-FILE tangles to.
+
+Runs ordinary `org-babel-tangle-file' for plain-text `:tangle' blocks
+(bibliography, CSL, ...), then `otd--tangle-binary-blocks' for any
+`:tangle-binary' blocks (e.g. a Word reference-doc), so pandoc always
+sees fresh files regenerated from whatever is embedded in ORG-FILE --
+never a stale copy left over from a previous export, and never a
+missing file because some external path doesn't exist on this
+machine."
+  (require 'ob-tangle)
+  (let ((default-directory dir))
+    (org-babel-tangle-file org-file))
+  (otd--tangle-binary-blocks org-file dir))
+
 ;;;; --- import ----------------------------------------------------------
 
 ;;;###autoload
@@ -622,6 +708,109 @@ pandoc's docx writer renders with multi-line cells intact."
            t t)))
       (write-region (point-min) (point-max) org-file nil 'silent))))
 
+(defun otd--parse-author-block (text)
+  "Parse `#+AFFIL:'/`#+AUTHOR_LIST:'/`#+AUTHOR_GROUP:' lines out of TEXT.
+
+Returns (AFFILS AUTHORS GROUP), where AFFILS is an alist of
+(KEY . DESCRIPTION) in declaration order, AUTHORS is a list of
+\(NAME AFFIL-KEYS CORRESPONDING-P), and GROUP is the trailing
+consortium/group-credit string or nil.
+
+Line syntax:
+  #+AFFIL: key :: institution, address ...
+  #+AUTHOR_LIST: Name :: key1, key2 :: corresponding
+  #+AUTHOR_GROUP: for the ... Study Group
+
+The `::' fields are used (rather than commas) because affiliation
+text routinely contains commas.  `corresponding' is the only
+recognized flag in the third field; absence of a third field means
+not corresponding."
+  (let (affils authors group)
+    (dolist (line (split-string text "\n"))
+      (cond
+       ((string-match "^#\\+AFFIL:[ \t]*\\([^ \t]+\\)[ \t]*::[ \t]*\\(.*\\)$" line)
+        ;; Capture into locals immediately: `match-string' reads global
+        ;; match-data, which a nested regex call (e.g. `split-string'
+        ;; below) would otherwise clobber before we get to read it.
+        (let ((key (match-string 1 line))
+              (desc (match-string 2 line)))
+          (push (cons key desc) affils)))
+       ((string-match "^#\\+AUTHOR_LIST:[ \t]*\\(.*?\\)[ \t]*::[ \t]*\\(.*?\\)\\(?:[ \t]*::[ \t]*\\(.*\\)\\)?$" line)
+        (let ((name (match-string 1 line))
+              (keys-str (match-string 2 line))
+              (flags-str (match-string 3 line)))
+          (push (list name
+                      (split-string keys-str "[ \t]*,[ \t]*")
+                      (and flags-str (string-match-p "corresponding" flags-str)))
+                authors)))
+       ((string-match "^#\\+AUTHOR_GROUP:[ \t]*\\(.*\\)$" line)
+        (setq group (match-string 1 line)))))
+    (list (nreverse affils) (nreverse authors) group)))
+
+(defun otd--generate-author-block (text)
+  "Generate the flat markdown author/affiliation block from TEXT.
+
+Affiliation superscript letters (a, b, c, ...) are assigned by
+`#+AFFIL:' declaration order -- the same order the numbered
+affiliation list is printed in -- so letter N always matches list
+item N, matching the journal's existing convention."
+  (cl-destructuring-bind (affils authors group) (otd--parse-author-block text)
+    (let* ((letters (let ((i -1))
+                      (mapcar (lambda (a) (cl-incf i) (cons (car a) (string (+ ?a i)))) affils)))
+           (author-strs
+            (mapcar (lambda (au)
+                      (let* ((name (nth 0 au))
+                             (keys (nth 1 au))
+                             (corresponding (nth 2 au))
+                             (sups (append (mapcar (lambda (k) (cdr (assoc k letters))) keys)
+                                           (when corresponding '("*")))))
+                        (format "%s^{%s}" name (string-join sups ","))))
+                    authors))
+           (author-line (concat (string-join author-strs ", ")
+                                 (when group (concat ", " group))))
+           (affil-lines
+            (let ((n 0))
+              (mapcar (lambda (a)
+                        (cl-incf n)
+                        (format "%d. %s" n (cdr a)))
+                      affils)))
+           (has-corresponding (cl-some (lambda (au) (nth 2 au)) authors)))
+      (concat "#+begin_export markdown\n"
+              author-line "\n\n"
+              (string-join affil-lines "\n\n")
+              "\n\n"
+              (when has-corresponding "*Corresponding author.\n")
+              "#+end_export"))))
+
+(defun otd--expand-author-block ()
+  "In the current buffer, replace `#+AFFIL:'/`#+AUTHOR_LIST:'/
+`#+AUTHOR_GROUP:' header lines with a generated `#+begin_export
+markdown' author/affiliation block.
+
+This is a pre-pandoc textual rewrite of the raw org source -- the
+same approach `otd--read-pandoc-options' uses for `#+PANDOC_OPTIONS:'
+-- because pandoc's org reader cannot carry structured per-author
+affiliation data through its native metadata: repeated `#+AUTHOR:'
+lines merge into one string, and arbitrary custom `#+KEY:' lines are
+silently dropped.  Doing nothing if no such lines are present keeps
+this backward-compatible with a hand-typed `#+begin_export markdown'
+block."
+  (let ((line-re "^#\\+\\(?:AFFIL\\|AUTHOR_LIST\\|AUTHOR_GROUP\\):.*\n?")
+        (text (buffer-string))
+        regions)
+    (when (string-match-p "^#\\+\\(?:AFFIL\\|AUTHOR_LIST\\|AUTHOR_GROUP\\):" text)
+      (let ((block (otd--generate-author-block text)))
+        (goto-char (point-min))
+        (while (re-search-forward line-re nil t)
+          (push (cons (match-beginning 0) (match-end 0)) regions))
+        (setq regions (nreverse regions))
+        (when regions
+          (let ((first-start (caar regions)))
+            (dolist (r (reverse regions))
+              (delete-region (car r) (cdr r)))
+            (goto-char first-start)
+            (insert block "\n\n")))))))
+
 (defun otd--read-pandoc-options (org-file)
   "Return a list of pandoc CLI args derived from headers in ORG-FILE.
 
@@ -758,34 +947,93 @@ existed so a re-export to docx preserves super/subscripts."
 
 ;;;; --- highlighting ----------------------------------------------------
 
+;; Every face below starts from `:inherit default' before adding its own
+;; override.  This is load-bearing, not decorative: org-mode's own emphasis
+;; fontification (`=verbatim=', `~code~', `+strikethrough+', ...) treats
+;; `{' and `}' as valid boundary characters by default (see
+;; `org-emphasis-regexp-components'), so almost every CriticMarkup token
+;; -- `{==...==}', `{--...--}', etc. -- accidentally also satisfies org's
+;; own emphasis syntax and gets fontified a second time underneath ours.
+;; Without an explicit `:inherit default' reset, any attribute OUR face
+;; doesn't set (e.g. foreground, if we only set background) falls through
+;; to org's face instead of the buffer's normal text -- which is why the
+;; highlighted-range text was showing up in org-verbatim's magenta.
+(defface otd-cm-marker
+  '((t :inherit default :height 0.75 :weight normal :slant normal :foreground "gray55"))
+  "Face for raw CriticMarkup delimiter punctuation ({++, ++}, {--,
+--}, {~~, ~>, ~~}, {>>, <<}, {==, ==}).  Shrunk and dimmed relative
+to body text so the delimiters recede visually instead of competing
+with the substantive text for attention -- the actual inserted/
+deleted/comment text stays at the buffer's normal font height.")
+
 (defface otd-insert
-  '((t :inherit success :weight bold))
+  '((t :inherit default :foreground "#2e7d32" :underline t :weight normal :slant normal))
   "Face for {++inserted++} text.")
 
 (defface otd-delete
-  '((t :inherit error :strike-through t))
+  '((t :inherit default :foreground "#c62828" :strike-through t :weight normal :slant normal))
   "Face for {--deleted--} text.")
 
-(defface otd-substitute
-  '((t :inherit warning :slant italic))
-  "Face for {~~old~>new~~} substitutions.")
+(defface otd-substitute-old
+  '((t :inherit default :foreground "#c62828" :strike-through t :weight normal :slant normal))
+  "Face for the old/replaced half of a {~~old~>new~~} substitution.")
+
+(defface otd-substitute-new
+  '((t :inherit default :foreground "#2e7d32" :underline t :weight normal :slant normal))
+  "Face for the new/replacement half of a {~~old~>new~~} substitution.")
 
 (defface otd-comment
-  '((t :inherit shadow :slant italic))
-  "Face for {>>comment<<} reviewer comments.")
+  '((t :inherit default :foreground "#455a64" :weight normal :slant normal))
+  "Face for {>>comment<<} reviewer comment text.")
+
+(defface otd-comment-author
+  '((t :inherit default :foreground "#1565c0" :weight normal :slant normal))
+  "Face for the [Author] tag inside a reviewer comment.")
+
+(defface otd-comment-done
+  '((t :inherit default :foreground "#2e7d32" :strike-through t :weight normal :slant normal))
+  "Face for the [DONE] tag marking a resolved comment.")
 
 (defface otd-highlight
-  '((t :inherit highlight))
-  "Face for {==highlighted==} text.")
+  '((t :inherit default :background "#fff9c4" :weight normal :slant normal))
+  "Face for {==highlighted==} text -- a soft background wash, no
+foreground/weight change, so it layers cleanly under an attached
+comment's own coloring.")
 
-;; Pandoc may stamp {++[author]++} or {--[author]--} attributions; we
-;; tolerate the optional [author] prefix inside the markers.
+;; Each pattern is split into its own delimiter/content capture groups
+;; so `otd-cm-marker' can be applied to the punctuation alone (shrunk +
+;; dimmed) while the substantive text keeps the buffer's normal height
+;; and gets a face that is color-coded (not size-coded) by change type.
+;; Pandoc may stamp {++[author]++} / {--[author]--} attributions; the
+;; optional [author]/[DONE] groups use `t' (laxmatch) since they don't
+;; always participate in the match.
 (defvar otd--keywords
-  '(("{\\+\\+\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)\\+\\+}" 0 'otd-insert     prepend)
-    ("{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}"          0 'otd-delete     prepend)
-    ("{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}"             0 'otd-substitute prepend)
-    ("{>>[^{}<]*<<}"                                    0 'otd-comment    prepend)
-    ("{==[^=]*==}"                                      0 'otd-highlight  prepend))
+  '(("\\({\\+\\+\\)\\(\\[[^]]+\\]\\)?\\([^{}]*?\\)\\(\\+\\+}\\)"
+     (1 'otd-cm-marker prepend)
+     (2 'otd-comment-author prepend t)
+     (3 'otd-insert prepend)
+     (4 'otd-cm-marker prepend))
+    ("\\({--\\)\\(\\[[^]]+\\]\\)?\\([^{}]*?\\)\\(--}\\)"
+     (1 'otd-cm-marker prepend)
+     (2 'otd-comment-author prepend t)
+     (3 'otd-delete prepend)
+     (4 'otd-cm-marker prepend))
+    ("\\({~~\\)\\([^~{}]*?\\)\\(~>\\)\\([^~{}]*?\\)\\(~~}\\)"
+     (1 'otd-cm-marker prepend)
+     (2 'otd-substitute-old prepend)
+     (3 'otd-cm-marker prepend)
+     (4 'otd-substitute-new prepend)
+     (5 'otd-cm-marker prepend))
+    ("\\({>>\\)\\(\\[[^]]+\\]\\)?[ \t]*\\(\\[DONE\\]\\)?[ \t]*\\([^{}<]*?\\)\\(<<}\\)"
+     (1 'otd-cm-marker prepend)
+     (2 'otd-comment-author prepend t)
+     (3 'otd-comment-done prepend t)
+     (4 'otd-comment prepend)
+     (5 'otd-cm-marker prepend))
+    ("\\({==\\)\\([^=]*\\)\\(==}\\)"
+     (1 'otd-cm-marker prepend)
+     (2 'otd-highlight prepend)
+     (3 'otd-cm-marker prepend)))
   "Font-lock keywords for CriticMarkup tokens.")
 
 (defvar otd-criticmarkup-mode-map
@@ -2169,9 +2417,20 @@ Author defaults to `otd-export-author'."
          (counts  nil))
     (unwind-protect
         (progn
+          ;; Stage 0: regenerate any embedded bibliography/CSL/reference-doc
+          ;; resources from their canonical `:tangle'/`:tangle-binary' source
+          ;; blocks in ORG-FILE, so the export always reflects whatever is
+          ;; embedded in the document itself rather than a possibly-stale or
+          ;; possibly-missing external file.  See `otd-tangle-before-export'.
+          (when otd-tangle-before-export
+            (otd--tangle-embedded-resources org-file dir))
           ;; Stage 1: fixups + CriticMarkup -> placeholders
           (with-temp-buffer
             (insert-file-contents org-file)
+            ;; Expand `#+AFFIL:'/`#+AUTHOR_LIST:'/`#+AUTHOR_GROUP:' header
+            ;; lines (if present) into the flat markdown author block
+            ;; pandoc actually needs.  See `otd--expand-author-block'.
+            (otd--expand-author-block)
             (otd--postfix-fixups)
             (let ((res (otd--mark-criticmarkup)))
               (setq alist  (car res)
@@ -2181,10 +2440,20 @@ Author defaults to `otd-export-author'."
           ;; `--standalone' is required to preserve `#+title:', `#+author:'
           ;; etc. as YAML frontmatter; without it pandoc's markdown writer
           ;; drops document metadata, which then never reaches docx.
+          ;; `--resource-path=dir' is required because ORG-TMP lives in a
+          ;; temp directory, not alongside ORG-FILE: any relative image
+          ;; link (e.g. `[[media/fig1.png]]') is only valid relative to
+          ;; ORG-FILE's own directory, so without this pandoc's org reader
+          ;; can't resolve it as a file and silently degrades the link to
+          ;; a `.spurious-link' text span instead of a real image --
+          ;; which in turn means pandoc-crossref never sees a figure to
+          ;; number, and every `[@fig:...]' reference to it comes back
+          ;; "Undefined cross-reference".
           (with-temp-buffer
             (let ((exit (apply #'call-process otd-pandoc-program nil t nil
                                (list "-f" "org" "-t" "markdown"
                                      "--standalone" "--wrap=none"
+                                     (concat "--resource-path=" dir)
                                      org-tmp "-o" md-tmp))))
               (unless (zerop exit)
                 (error "pandoc org->md exit %s:\n%s" exit (buffer-string)))))
@@ -2197,10 +2466,17 @@ Author defaults to `otd-export-author'."
           ;; User-supplied `#+PANDOC_OPTIONS:' and `#+bibliography:'
           ;; headers are forwarded so citeproc, CSL, reference-doc, etc.
           ;; behave the same as M-x org-pandoc-export-to-docx would.
+          ;; `--resource-path=dir' again, for the same reason as stage 2:
+          ;; MD-TMP lives in a temp directory, so any relative image path
+          ;; pandoc's org reader left unresolved (or re-relativized) must
+          ;; still be resolved against ORG-FILE's directory when the docx
+          ;; writer goes to actually embed the image bytes.
           (with-temp-buffer
             (let* ((user-args (otd--read-pandoc-options org-file))
                    (pandoc-args (append (list "-f" "markdown" "-t" "docx"
-                                              "--wrap=none" md-tmp "-o" out)
+                                              "--wrap=none"
+                                              (concat "--resource-path=" dir)
+                                              md-tmp "-o" out)
                                         user-args))
                    (exit (apply #'call-process otd-pandoc-program nil t nil
                                 pandoc-args)))
@@ -2211,6 +2487,13 @@ Author defaults to `otd-export-author'."
           ;; cite keys / metadata that the docx body cannot represent.
           (when otd-embed-source
             (otd--embed-org-source out org-file))
+          ;; Stage 6: rewrite table borders directly (see `otd-fix-table-borders').
+          (when otd-fix-table-borders
+            (with-temp-buffer
+              (let ((exit (call-process otd-python-program nil t nil
+                                        otd-table-borders-script out)))
+                (unless (zerop exit)
+                  (error "otd-table-borders.py exit %s:\n%s" exit (buffer-string))))))
           (message "Exported %s -> %s  (++%d --%d ~~%d ==%d >>%d)"
                    (file-name-nondirectory org-file)
                    (file-name-nondirectory out)
