@@ -1081,7 +1081,7 @@ comment's own coloring.")
      (3 'otd-comment-done prepend t)
      (4 'otd-comment prepend)
      (5 'otd-cm-marker prepend))
-    ("\\({==\\)\\([^=]*\\)\\(==}\\)"
+    ("\\({==\\)\\(.*?\\)\\(==}\\)"
      (1 'otd-cm-marker prepend)
      (2 'otd-highlight prepend)
      (3 'otd-cm-marker prepend))
@@ -1189,7 +1189,7 @@ value, comments are dropped, highlights are kept as plain text."
   (otd--replace "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}"         "")
   (otd--replace "{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}"            "\\2")
   (otd--replace "{>>[^{}<]*<<}"                                   "")
-  (otd--replace "{==\\([^=]*\\)==}"                               "\\1"))
+  (otd--replace "{==\\(.*?\\)==}"                               "\\1"))
 
 ;;;###autoload
 (defun otd-reject-all ()
@@ -1199,7 +1199,7 @@ value, comments are dropped, highlights are kept as plain text."
   (otd--replace "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}"         "\\1")
   (otd--replace "{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}"            "\\1")
   (otd--replace "{>>[^{}<]*<<}"                                   "")
-  (otd--replace "{==\\([^=]*\\)==}"                               "\\1"))
+  (otd--replace "{==\\(.*?\\)==}"                               "\\1"))
 
 ;;;; --- review workflow: navigate, accept/reject at point, manage done -
 
@@ -1213,7 +1213,7 @@ value, comments are dropped, highlights are kept as plain text."
    "{\\+\\+\\(?:\\[[^]]+\\]\\)?[^{}]*?\\+\\+}"      ; insertion
    "\\|{--\\(?:\\[[^]]+\\]\\)?[^{}]*?--}"            ; deletion
    "\\|{~~[^~{}]*?~>[^~{}]*?~~}"                     ; substitution
-   "\\|{==[^=]*==}"                                  ; highlight
+   "\\|{==.*?==}"                                  ; highlight
    "\\|{>>[^{}<]*<<}"                                ; comment
    "\\)")
   "Single-pass regex matching any one CriticMarkup token.")
@@ -1336,7 +1336,7 @@ markers, drop comments)."
                ;; Strip the `{==...==}' wrapper and drop every trailing
                ;; `{>>..<<}' so the visible prose is what remains.
                (when (string-match
-                      "\\`{==\\([^=]*\\)==}\\(?:{>>[^{}<]*<<}\\)*\\'" text)
+                      "\\`{==\\(.*?\\)==}\\(?:{>>[^{}<]*<<}\\)*\\'" text)
                  (match-string 1 text)))
               ((or `(cmt . accept) `(cmt . reject)) ""))))
       (unless new
@@ -1450,7 +1450,7 @@ are preserved."
     ;; Emacs regex has no `(?!...)' lookahead, so check by hand.
     (save-excursion
       (goto-char (point-min))
-      (while (re-search-forward "{==\\([^=]*\\)==}" nil t)
+      (while (re-search-forward "{==\\(.*?\\)==}" nil t)
         (let ((beg (match-beginning 0))
               (end (match-end 0))
               (inner (match-string 1)))
@@ -1748,8 +1748,8 @@ comments removed, highlights stripped of markers)."
     (setq s (replace-regexp-in-string "{\\+\\+\\(?:\\[[^]]+\\]\\)?[^{}]*?\\+\\+}" "" s))
     (setq s (replace-regexp-in-string "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}" "\\1" s))
     (setq s (replace-regexp-in-string "{~~\\([^~{}]*?\\)~>[^~{}]*?~~}" "\\1" s))
-    (setq s (replace-regexp-in-string "{==\\([^=]*?\\)==}{>>[^<]*?<<}" "\\1" s))
-    (setq s (replace-regexp-in-string "{==\\([^=]*?\\)==}" "\\1" s))
+    (setq s (replace-regexp-in-string "{==\\(.*?\\)==}{>>[^<]*?<<}" "\\1" s))
+    (setq s (replace-regexp-in-string "{==\\(.*?\\)==}" "\\1" s))
     (setq s (replace-regexp-in-string "{>>[^<]*?<<}" "" s))
     s))
 
@@ -2629,7 +2629,7 @@ resolved in the generated docx's `commentsExtended.xml'."
       ;; encodes on import), peel it off and use it as the docx author so the
       ;; original reviewer name round-trips back to Word.
       (goto-char (point-min))
-      (while (re-search-forward "{==\\([^=]*\\)==}{>>\\([^<]*\\)<<}" nil t)
+      (while (re-search-forward "{==\\(.*?\\)==}{>>\\([^<]*\\)<<}" nil t)
         (let* ((range (match-string 1))
                (ctext-raw (match-string 2))
                ;; save-match-data: `otd--parse-comment-author' calls
@@ -2676,7 +2676,7 @@ resolved in the generated docx's `commentsExtended.xml'."
         (cl-incf n-del))
       ;; Orphan {==range==} (no following comment): drop markers, keep text.
       (goto-char (point-min))
-      (while (re-search-forward "{==\\([^=]*\\)==}" nil t)
+      (while (re-search-forward "{==\\(.*?\\)==}" nil t)
         (replace-match (stash (match-string 1)) t t)
         (cl-incf n-hi))
       ;; Orphan {>>comment<<}: zero-range comment so it still appears in Word.
