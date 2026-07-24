@@ -66,6 +66,19 @@ metadata headers, etc.) which the docx body cannot represent.
 `otd-import' detects the part automatically and uses it for merge."
   :type 'boolean :group 'org-tracked-docx)
 
+(defcustom otd-embed-custom-property nil
+  "When non-nil, `otd-export' ALSO embeds the org source as a single
+docProps/custom.xml custom property, as a fallback for WPS Office
+\(which strips customXml/ parts on save but keeps custom properties).
+
+Off by default: a single custom property holding an entire manuscript's
+org source as one base64 string is well outside what docProps/custom.xml
+properties are meant to hold, and is a confirmed cause of Word's \"found
+unreadable content\" repair prompt.  Only enable this if you specifically
+need a reviewed docx to survive a round-trip through WPS Office, and
+accept the risk of Word flagging the file for repair on open."
+  :type 'boolean :group 'org-tracked-docx)
+
 (defcustom otd-import-auto-merge t
   "When non-nil and the imported docx carries an embedded org source
 \(see `otd-embed-source'), `otd-import' runs `otd--merge-content' to
@@ -98,6 +111,20 @@ to rewrite table borders directly in the generated docx."
 
 (defcustom otd-python-program "python3"
   "Python interpreter used to run `otd-table-borders-script'."
+  :type 'string :group 'org-tracked-docx)
+
+(defcustom otd-resolve-done-comments t
+  "When non-nil, `otd-export' marks every `[DONE]'-tagged CriticMarkup
+comment as actually Resolved in Word's reviewing pane, via
+`otd-resolve-comments-script', instead of leaving the literal `[DONE] '
+text as part of the comment body."
+  :type 'boolean :group 'org-tracked-docx)
+
+(defcustom otd-resolve-comments-script
+  (expand-file-name "otd-resolve-comments.py"
+                     (file-name-directory (or load-file-name buffer-file-name)))
+  "Path to the Python script `otd-export' runs (see
+`otd-resolve-done-comments') to mark `[DONE]' comments Resolved."
   :type 'string :group 'org-tracked-docx)
 
 (defcustom otd-tangle-before-export t
@@ -764,7 +791,14 @@ item N, matching the journal's existing convention."
                              (corresponding (nth 2 au))
                              (sups (append (mapcar (lambda (k) (cdr (assoc k letters))) keys)
                                            (when corresponding '("*")))))
-                        (format "%s^{%s}" name (string-join sups ","))))
+                        ;; `^text^' (pandoc markdown superscript), not
+                        ;; org's `^{text}' -- this block is emitted inside
+                        ;; a #+begin_export markdown span, which bypasses
+                        ;; org's own superscript handling entirely and is
+                        ;; read by pandoc's *markdown* reader instead, so
+                        ;; it needs pandoc's own superscript syntax or the
+                        ;; braces render as literal, unformatted text.
+                        (format "%s^%s^" name (string-join sups ","))))
                     authors))
            (author-line (concat (string-join author-strs ", ")
                                  (when group (concat ", " group))))
@@ -1541,8 +1575,15 @@ to `otd--extract-org-source'."
           ;; Belt-and-braces: also embed in docProps/custom.xml as a
           ;; base64 property.  WPS Office strips customXml/ on save but
           ;; keeps custom document properties; this redundant copy is
-          ;; what lets the round-trip survive a WPS edit.
-          (otd--embed-custom-property tmpdir org-content)
+          ;; what lets the round-trip survive a WPS edit.  Off by
+          ;; default (see `otd-embed-custom-property'): a single custom
+          ;; property holding the entire org source as one base64 string
+          ;; (150KB+ for a real manuscript) is well outside what
+          ;; docProps/custom.xml properties are meant to hold, and is a
+          ;; confirmed, reproducible cause of Word's "found unreadable
+          ;; content" repair prompt on this document.
+          (when otd-embed-custom-property
+            (otd--embed-custom-property tmpdir org-content))
           ;; Repackage.
           (delete-file docx-path)
           (let ((default-directory (file-name-as-directory tmpdir)))
@@ -1993,8 +2034,13 @@ lossy versions and would otherwise prevent paragraph-level alignment)."
   "Parse a `[Author Name] rest…' prefix out of TEXT.
 Returns (AUTHOR . REST) when the prefix is present, otherwise (nil . TEXT).
 `otd--rewrite-spans' adds the prefix on import so `otd-export' can route
-the original reviewer name back to Word's `<w:comment w:author=…>'."
-  (if (string-match "\\`\\[\\([^][]+\\)\\][ \t]+\\(\\(?:.\\|\n\\)*\\)\\'" text)
+the original reviewer name back to Word's `<w:comment w:author=…>'.
+Allows one level of nested brackets in the name (e.g. `[Chandra Reynolds
+[2]]'), since a bracket-exclusion class alone can't match those and
+would otherwise leave the whole `[Name [2]]' tag as unparsed comment
+text, hiding a `[DONE]' marker one level too deep for
+`otd--strip-done-prefix' to find at the very start of the body."
+  (if (string-match "\\`\\[\\(\\(?:[^][]\\|\\[[^][]*\\]\\)+\\)\\][ \t]+\\(\\(?:.\\|\n\\)*\\)\\'" text)
       (cons (match-string 1 text) (match-string 2 text))
     (cons nil text)))
 
@@ -2441,7 +2487,8 @@ Author defaults to `otd-export-author'."
          (org-tmp (make-temp-file "otd-out-" nil ".org"))
          (md-tmp  (make-temp-file "otd-out-" nil ".md"))
          (alist   nil)
-         (counts  nil))
+         (counts  nil)
+         (done-ids nil))
     (unwind-protect
         (progn
           ;; Stage 0: regenerate any embedded bibliography/CSL/reference-doc
@@ -2460,8 +2507,9 @@ Author defaults to `otd-export-author'."
             (otd--expand-author-block)
             (otd--postfix-fixups)
             (let ((res (otd--mark-criticmarkup)))
-              (setq alist  (car res)
-                    counts (cdr res)))
+              (setq alist    (nth 0 res)
+                    counts   (nth 1 res)
+                    done-ids (nth 2 res)))
             (write-region (point-min) (point-max) org-tmp nil 'silent))
           ;; Stage 2: org -> markdown (placeholders pass through unchanged).
           ;; `--standalone' is required to preserve `#+title:', `#+author:'
@@ -2521,6 +2569,19 @@ Author defaults to `otd-export-author'."
                                         otd-table-borders-script out)))
                 (unless (zerop exit)
                   (error "otd-table-borders.py exit %s:\n%s" exit (buffer-string))))))
+          ;; Stage 7: mark `[DONE]' comments Resolved in Word's reviewing
+          ;; pane (see `otd-resolve-done-comments').  Always run this even
+          ;; when DONE-IDS is empty: it still stamps every comment with a
+          ;; w14:paraId, which pandoc never emits and a future otd-export
+          ;; run needs already present to append further resolved-comment
+          ;; entries idempotently.
+          (when otd-resolve-done-comments
+            (with-temp-buffer
+              (let ((exit (call-process otd-python-program nil t nil
+                                        otd-resolve-comments-script out
+                                        (string-join done-ids ","))))
+                (unless (zerop exit)
+                  (error "otd-resolve-comments.py exit %s:\n%s" exit (buffer-string))))))
           (message "Exported %s -> %s  (++%d --%d ~~%d ==%d >>%d)"
                    (file-name-nondirectory org-file)
                    (file-name-nondirectory out)
@@ -2531,14 +2592,30 @@ Author defaults to `otd-export-author'."
       (when (file-exists-p md-tmp)  (delete-file md-tmp)))
     out))
 
+(defun otd--strip-done-prefix (ctext)
+  "If CTEXT (a comment body, author-prefix already stripped) begins
+with a `[DONE]' marker, return (T . REST-WITHOUT-MARKER); otherwise
+return (nil . CTEXT) unchanged.  Used so a `[DONE]'-tagged comment
+exports to Word as an actually-resolved comment (see
+`otd--resolve-comments-script') instead of carrying the literal
+`[DONE] ' text into the comment body."
+  (if (string-match "\\`\\[DONE\\][ \t]*" ctext)
+      (cons t (substring ctext (match-end 0)))
+    (cons nil ctext)))
+
 (defun otd--mark-criticmarkup ()
   "Replace CriticMarkup tokens in current buffer with sentinel placeholders.
-Return (ALIST . COUNTS) where ALIST maps each placeholder string to the
-pandoc-span replacement to splice in once we are out of the org reader,
-and COUNTS is a plist of token counts."
+Return (ALIST COUNTS DONE-IDS) where ALIST maps each placeholder string
+to the pandoc-span replacement to splice in once we are out of the org
+reader, COUNTS is a plist of token counts, and DONE-IDS is a list of
+pandoc comment-id strings (matching the `id=\"N\"' in the comment-start/
+comment-end spans) whose CriticMarkup body carried a `[DONE]' marker --
+consumed by `otd--resolve-comments-script' to mark those comments
+resolved in the generated docx's `commentsExtended.xml'."
   (let ((alist nil)
         (id 0)
         (n-ins 0) (n-del 0) (n-sub 0) (n-hi 0) (n-cmt 0)
+        (done-ids nil)
         (author (or otd-export-author ""))
         (date   (format-time-string "%Y-%m-%dT%H:%M:%SZ" nil t)))
     (cl-flet
@@ -2561,8 +2638,10 @@ and COUNTS is a plist of token counts."
                (parsed (save-match-data
                          (otd--parse-comment-author ctext-raw)))
                (use-author (or (car parsed) author))
-               (ctext (cdr parsed))
+               (done-parsed (save-match-data (otd--strip-done-prefix (cdr parsed))))
+               (ctext (cdr done-parsed))
                (n     (1+ id)))
+          (when (car done-parsed) (push (number-to-string n) done-ids))
           (replace-match
            (stash (format "[%s]{.comment-start id=\"%d\" author=\"%s\" date=\"%s\"}%s[]{.comment-end id=\"%d\"}"
                           ctext n use-author date range n))
@@ -2607,15 +2686,18 @@ and COUNTS is a plist of token counts."
                (parsed (save-match-data
                          (otd--parse-comment-author ctext-raw)))
                (use-author (or (car parsed) author))
-               (ctext (cdr parsed))
+               (done-parsed (save-match-data (otd--strip-done-prefix (cdr parsed))))
+               (ctext (cdr done-parsed))
                (n     (1+ id)))
+          (when (car done-parsed) (push (number-to-string n) done-ids))
           (replace-match
            (stash (format "[%s]{.comment-start id=\"%d\" author=\"%s\" date=\"%s\"}[]{.comment-end id=\"%d\"}"
                           ctext n use-author date n))
            t t))
         (cl-incf n-cmt)))
-    (cons alist
-          (list :ins n-ins :del n-del :sub n-sub :hi n-hi :cmt n-cmt))))
+    (list alist
+          (list :ins n-ins :del n-del :sub n-sub :hi n-hi :cmt n-cmt)
+          done-ids)))
 
 (defun otd--unmark-criticmarkup (md-file alist)
   "Replace each ALIST placeholder with its pandoc-span value in MD-FILE."
