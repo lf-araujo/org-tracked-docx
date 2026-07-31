@@ -428,6 +428,22 @@ Return a plist with counts of each marker emitted."
       ;; common case where reviewers leave overlapping comments on the same
       ;; paragraph).  Each iteration finds the comment-start whose matching
       ;; comment-end is closest, replaces that pair, and re-scans.
+      ;;
+      ;; CTEXT itself can contain `]' (a reviewer's comment quoting a
+      ;; citation or markdown link, e.g. `[text](url)'), so this cannot
+      ;; search forward for the opening `[' with a `[^]]*' class the way
+      ;; the old version did -- that stops at CTEXT's own first `]' and
+      ;; the whole match then fails to find `{.comment-start' next,
+      ;; silently dropping the comment: its start marker vanishes, `]'
+      ;; and everything after briefly gets swallowed into pandoc's own
+      ;; markdown-link/attribute-span parsing on the next pandoc pass, and
+      ;; the comment body itself leaks into the docx as literal prose.
+      ;; Instead, search forward for the unambiguous fixed closing tag
+      ;; `]{.comment-start id="N"...}' first (never itself contains `]'),
+      ;; then scan backward from that `]' counting bracket depth (same
+      ;; technique as the insertion/deletion scanner below) to find its
+      ;; true matching `[', however many nested `[...]' constructs CTEXT
+      ;; itself contains.
       (let ((more t))
         (while more
           (setq more nil)
@@ -436,15 +452,26 @@ Return a plist with counts of each marker emitted."
             (save-excursion
               (goto-char (point-min))
               (while (re-search-forward
-                      "\\[\\([^]]*\\)\\]{\\.comment-start[[:space:]]+id=\"\\([0-9]+\\)\"\\([^}]*\\)}"
+                      "\\]{\\.comment-start[[:space:]]+id=\"\\([0-9]+\\)\"\\([^}]*\\)}"
                       nil t)
-                (let* ((ctext (match-string 1))
-                       (id    (match-string 2))
-                       (attrs (match-string 3))
+                (let* ((id    (match-string 1))
+                       (attrs (match-string 2))
+                       (rbpos (match-beginning 0)) ; position of the closing `]'
                        ;; Capture positions BEFORE string-match clobbers the
                        ;; outer re-search-forward's match data.
-                       (start (match-beginning 0))
                        (after (match-end 0))
+                       (open  (let ((depth 1) (p (1- rbpos)))
+                                (while (and (> p (point-min)) (> depth 0))
+                                  (let ((c (char-after p)))
+                                    (cond ((eq c ?\]) (cl-incf depth))
+                                          ((eq c ?\[) (cl-decf depth)
+                                           (when (zerop depth) (setq open p)))))
+                                  (setq p (1- p)))
+                                open))
+                       (start (or open rbpos))
+                       (ctext (if open
+                                  (buffer-substring-no-properties (1+ open) rbpos)
+                                ""))
                        (author (and (string-match
                                      "author=\"\\([^\"]*\\)\"" attrs)
                                     (match-string 1 attrs))))
