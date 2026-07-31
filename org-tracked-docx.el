@@ -1668,9 +1668,22 @@ Creates and registers custom.xml if pandoc didn't already emit it."
   "Return the embedded org source from DOCX-PATH or nil.
 Tries the customXml/ part first (preserved by Word and LibreOffice),
 falls back to the docProps/custom.xml `OrgTrackedSource' property
-\(preserved by WPS Office and other tools that strip customXml/)."
-  (or (otd--extract-org-source-customxml docx-path)
-      (otd--extract-org-source-property  docx-path)))
+\(preserved by WPS Office and other tools that strip customXml/).
+
+Normalizes CRLF/CR to LF: Word rewrites embedded customXml parts with
+CRLF line endings whenever it re-saves the docx (e.g. after a
+coauthor's review round), even though `otd--embed-org-source' only
+ever wrote LF. The stray CR before each newline shifts every
+`otd--split-paragraphs' paragraph boundary check and breaks the
+`^:PROPERTIES:$'/`^:END:$' drawer regexes in `otd--merge-content',
+which then fail to peel the property drawer off the first body
+paragraph -- corrupting that paragraph's alignment fingerprint and
+cascading into dropped or misplaced content for everything merged
+after it (we saw the Abstract paragraph itself replaced by the
+document's byline block this way)."
+  (let ((source (or (otd--extract-org-source-customxml docx-path)
+                     (otd--extract-org-source-property  docx-path))))
+    (and source (replace-regexp-in-string "\r\n?" "\n" source))))
 
 (defun otd--extract-org-source-property (docx-path)
   "Extract source from docProps/custom.xml OrgTrackedSource property."
@@ -1743,14 +1756,29 @@ as `<basename>-source.org'.  Errors if no embedded source is found."
 (defun otd--strip-criticmarkup (text)
   "Return TEXT with all CriticMarkup tokens flattened to the rejected
 state (insertions removed, deletions kept, substitutions take old,
-comments removed, highlights stripped of markers)."
-  (let ((s text))
-    (setq s (replace-regexp-in-string "{\\+\\+\\(?:\\[[^]]+\\]\\)?[^{}]*?\\+\\+}" "" s))
-    (setq s (replace-regexp-in-string "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}" "\\1" s))
-    (setq s (replace-regexp-in-string "{~~\\([^~{}]*?\\)~>[^~{}]*?~~}" "\\1" s))
-    (setq s (replace-regexp-in-string "{==\\(.*?\\)==}{>>[^<]*?<<}" "\\1" s))
-    (setq s (replace-regexp-in-string "{==\\(.*?\\)==}" "\\1" s))
-    (setq s (replace-regexp-in-string "{>>[^<]*?<<}" "" s))
+comments removed, highlights stripped of markers).
+
+Runs the token substitutions to a fixpoint rather than a single pass.
+When multiple reviewers comment on the same or overlapping span,
+CriticMarkup nests, e.g. `{=={==text{====}{>>c1<<}==}{>>c2<<}==}{>>c3<<}'.
+A single pass over `{==\\(.*?\\)==}' only unwinds the innermost
+`==}{>>...<<}' it meets and leaves outer `{=='/`==}'/`{>>...<<}'
+fragments behind in the result (e.g. `text{=={====}==}'); that
+leftover then corrupts the normalized fingerprint `otd--normalize-for-
+match' builds from it, which in turn desyncs `otd--align-paragraphs'
+from that paragraph on and cascades into dropped/misplaced content
+for everything after it in the merge. Looping until the string stops
+changing peels one nesting level per pass, so any depth of nested
+comments fully flattens."
+  (let ((s text) (prev nil))
+    (while (not (equal s prev))
+      (setq prev s)
+      (setq s (replace-regexp-in-string "{\\+\\+\\(?:\\[[^]]+\\]\\)?[^{}]*?\\+\\+}" "" s))
+      (setq s (replace-regexp-in-string "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}" "\\1" s))
+      (setq s (replace-regexp-in-string "{~~\\([^~{}]*?\\)~>[^~{}]*?~~}" "\\1" s))
+      (setq s (replace-regexp-in-string "{==\\([^{}]*?\\)==}{>>[^<]*?<<}" "\\1" s))
+      (setq s (replace-regexp-in-string "{==\\([^{}]*?\\)==}" "\\1" s))
+      (setq s (replace-regexp-in-string "{>>[^<]*?<<}" "" s)))
     s))
 
 (defun otd--has-criticmarkup-p (text)
@@ -1985,15 +2013,17 @@ template uses NBSP)."
 
 A paragraph is a maximal run of consecutive non-blank lines that are
 not org headings (`*+ '), not property drawers (`:PROPERTIES:'..`:END:'),
-not export blocks (`#+BEGIN_EXPORT'..`#+END_EXPORT'), and not other
-keyword lines (`#+...').  Headings become their own one-line paragraphs;
-drawers, export blocks, and keyword lines are skipped from matching
-\(they are emitted by pandoc inconsistently between canonical and
-lossy versions and would otherwise prevent paragraph-level alignment)."
+not export blocks (`#+BEGIN_EXPORT'..`#+END_EXPORT'), not src blocks
+(`#+BEGIN_SRC'..`#+END_SRC'), and not other keyword lines (`#+...').
+Headings become their own one-line paragraphs; drawers, export/src
+blocks, and keyword lines are skipped from matching (they are emitted
+by pandoc inconsistently between canonical and lossy versions and
+would otherwise prevent paragraph-level alignment)."
   (let ((paras nil)
         (current nil)
         (in-drawer nil)
-        (in-export nil))
+        (in-export nil)
+        (in-src nil))
     (dolist (line (split-string content "\n"))
       (cond
        ((string-match-p "^[ \t]*:PROPERTIES:[ \t]*$" line)
@@ -2015,6 +2045,19 @@ lossy versions and would otherwise prevent paragraph-level alignment)."
                (string-match-p "^#\\+END_EXPORT" line)))
         (setq in-export nil))
        (in-export)
+       ;; Same rationale for `#+begin_src'/`#+end_src' asset blocks
+       ;; (bibtex/CSL/reference-doc): Word never shows the reviewer
+       ;; the raw asset, only citeproc's rendered numbered reference
+       ;; list, so those lines can never fingerprint-match a bibtex
+       ;; entry and must not be counted as alignable body paragraphs.
+       ((let ((case-fold-search t))
+          (string-match-p "^#\\+BEGIN_SRC" line))
+        (setq in-src t))
+       ((and in-src
+             (let ((case-fold-search t))
+               (string-match-p "^#\\+END_SRC" line)))
+        (setq in-src nil))
+       (in-src)
        ((string-match-p "^#\\+" line))     ;; skip keyword lines
        ((string-empty-p (string-trim line))
         (when current
@@ -2385,6 +2428,16 @@ Tracked paragraphs that align to no canonical paragraph (e.g. the docx
 bibliography section, which canonical does not contain because it is
 regenerated by citeproc on export) are dropped.
 
+`#+begin_src'..`#+end_src' blocks (bibtex/CSL/reference-doc assets
+tangled out on export) are passed through from CANONICAL verbatim,
+same as property drawers and export blocks: Word only ever shows the
+reader a citeproc-rendered numbered reference list, never the
+underlying bibtex, so there is no tracked-side text that could ever
+fingerprint-match a bibtex entry. Without this passthrough those
+numbered-reference-list paragraphs get positionally misaligned onto
+the bibtex/CSL/reference-doc paragraphs one-for-one, corrupting all
+three src blocks.
+
 Returns (MERGED-STRING . PLIST) where PLIST has keys
 :merged-paragraphs, :cm-paragraphs, :cite-keys, :reanchored-comments."
   (let* ((cite-map (otd--build-cite-map canonical))
@@ -2404,7 +2457,8 @@ Returns (MERGED-STRING . PLIST) where PLIST has keys
          (output nil)
          (current nil)
          (in-drawer nil)
-         (in-export nil))
+         (in-export nil)
+         (in-src nil))
     (cl-labels
         ((flush ()
            (when current
@@ -2437,6 +2491,16 @@ Returns (MERGED-STRING . PLIST) where PLIST has keys
                  (string-match-p "^#\\+END_EXPORT" line)))
           (setq in-export nil) (push line output))
          (in-export (push line output))
+         ;; `#+begin_src'/`#+end_src' asset blocks: verbatim passthrough,
+         ;; same rationale as export blocks (see docstring).
+         ((let ((case-fold-search t))
+            (string-match-p "^#\\+BEGIN_SRC" line))
+          (flush) (setq in-src t) (push line output))
+         ((and in-src
+               (let ((case-fold-search t))
+                 (string-match-p "^#\\+END_SRC" line)))
+          (setq in-src nil) (push line output))
+         (in-src (push line output))
          ((or (string-match-p "^#\\+" line)
               (string-match-p "^\\*+[ \t]" line)
               (string-empty-p (string-trim line)))
