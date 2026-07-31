@@ -2675,90 +2675,115 @@ reader, COUNTS is a plist of token counts, and DONE-IDS is a list of
 pandoc comment-id strings (matching the `id=\"N\"' in the comment-start/
 comment-end spans) whose CriticMarkup body carried a `[DONE]' marker --
 consumed by `otd--resolve-comments-script' to mark those comments
-resolved in the generated docx's `commentsExtended.xml'."
+resolved in the generated docx's `commentsExtended.xml'.
+
+Runs the full 6-pass sweep to a fixpoint rather than once. When
+reviewers comment on the same/overlapping span, CriticMarkup nests,
+e.g. `{=={====}{>>c1<<}==}{>>c2<<}'. A single sweep's highlight+comment
+regex used `.*?' (any character, brace-blind), so on a nested span it
+paired the OUTER `{==' with the FIRST `==}{>>' it could find -- which
+sits inside the inner `{====}' token -- swallowing the inner token's
+own `{==' into the outer match's captured range and leaking it as
+literal comment-anchored text in the exported docx body, while the
+now-orphaned outer `==}' had no token left to belong to and leaked too
+(this is what showed up as stray `{==' / `==}' fragments in Word).
+`[^{}]*?' makes the range brace-aware so a sweep only matches complete,
+non-nested tokens; looping the whole 6-pass sweep until nothing changes
+then lets each pass peel one nesting level (converting an inner token
+to a plain-text placeholder) so the next pass's sweep can cleanly match
+what is now an unnested outer token, however deep the original nesting."
   (let ((alist nil)
         (id 0)
         (n-ins 0) (n-del 0) (n-sub 0) (n-hi 0) (n-cmt 0)
         (done-ids nil)
         (author (or otd-export-author ""))
-        (date   (format-time-string "%Y-%m-%dT%H:%M:%SZ" nil t)))
+        (date   (format-time-string "%Y-%m-%dT%H:%M:%SZ" nil t))
+        (changed t))
     (cl-flet
         ((stash (replacement)
            (cl-incf id)
            (let ((tag (format "OTDPHX%05dXEND" id)))
              (push (cons tag replacement) alist)
              tag)))
-      ;; {==range==}{>>comment<<} -> comment-start..comment-end pair
-      ;; If COMMENT begins with `[Author Name] ' (the prefix `otd--rewrite-spans'
-      ;; encodes on import), peel it off and use it as the docx author so the
-      ;; original reviewer name round-trips back to Word.
-      (goto-char (point-min))
-      (while (re-search-forward "{==\\(.*?\\)==}{>>\\([^<]*\\)<<}" nil t)
-        (let* ((range (match-string 1))
-               (ctext-raw (match-string 2))
-               ;; save-match-data: `otd--parse-comment-author' calls
-               ;; `string-match' which clobbers the outer regex's match data
-               ;; before `replace-match' uses it.
-               (parsed (save-match-data
-                         (otd--parse-comment-author ctext-raw)))
-               (use-author (or (car parsed) author))
-               (done-parsed (save-match-data (otd--strip-done-prefix (cdr parsed))))
-               (ctext (cdr done-parsed))
-               (n     (1+ id)))
-          (when (car done-parsed) (push (number-to-string n) done-ids))
-          (replace-match
-           (stash (format "[%s]{.comment-start id=\"%d\" author=\"%s\" date=\"%s\"}%s[]{.comment-end id=\"%d\"}"
-                          ctext n use-author date range n))
-           t t))
-        (cl-incf n-cmt) (cl-incf n-hi))
-      ;; {~~old~>new~~} -> [old]{.deletion}[new]{.insertion}
-      (goto-char (point-min))
-      (while (re-search-forward "{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}" nil t)
-        (let ((old (match-string 1)) (new (match-string 2)))
-          (replace-match
-           (stash (format "[%s]{.deletion author=\"%s\" date=\"%s\"}[%s]{.insertion author=\"%s\" date=\"%s\"}"
-                          old author date new author date))
-           t t))
-        (cl-incf n-sub))
-      ;; {++text++} -> [text]{.insertion}
-      (goto-char (point-min))
-      (while (re-search-forward "{\\+\\+\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)\\+\\+}" nil t)
-        (let ((s (match-string 1)))
-          (replace-match
-           (stash (format "[%s]{.insertion author=\"%s\" date=\"%s\"}"
-                          s author date))
-           t t))
-        (cl-incf n-ins))
-      ;; {--text--} -> [text]{.deletion}
-      (goto-char (point-min))
-      (while (re-search-forward "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}" nil t)
-        (let ((s (match-string 1)))
-          (replace-match
-           (stash (format "[%s]{.deletion author=\"%s\" date=\"%s\"}"
-                          s author date))
-           t t))
-        (cl-incf n-del))
-      ;; Orphan {==range==} (no following comment): drop markers, keep text.
-      (goto-char (point-min))
-      (while (re-search-forward "{==\\(.*?\\)==}" nil t)
-        (replace-match (stash (match-string 1)) t t)
-        (cl-incf n-hi))
-      ;; Orphan {>>comment<<}: zero-range comment so it still appears in Word.
-      (goto-char (point-min))
-      (while (re-search-forward "{>>\\([^<]*\\)<<}" nil t)
-        (let* ((ctext-raw (match-string 1))
-               (parsed (save-match-data
-                         (otd--parse-comment-author ctext-raw)))
-               (use-author (or (car parsed) author))
-               (done-parsed (save-match-data (otd--strip-done-prefix (cdr parsed))))
-               (ctext (cdr done-parsed))
-               (n     (1+ id)))
-          (when (car done-parsed) (push (number-to-string n) done-ids))
-          (replace-match
-           (stash (format "[%s]{.comment-start id=\"%d\" author=\"%s\" date=\"%s\"}[]{.comment-end id=\"%d\"}"
-                          ctext n use-author date n))
-           t t))
-        (cl-incf n-cmt)))
+      (while changed
+        (setq changed nil)
+        ;; {==range==}{>>comment<<} -> comment-start..comment-end pair
+        ;; If COMMENT begins with `[Author Name] ' (the prefix `otd--rewrite-spans'
+        ;; encodes on import), peel it off and use it as the docx author so the
+        ;; original reviewer name round-trips back to Word.
+        (goto-char (point-min))
+        (while (re-search-forward "{==\\([^{}]*?\\)==}{>>\\([^<]*\\)<<}" nil t)
+          (setq changed t)
+          (let* ((range (match-string 1))
+                 (ctext-raw (match-string 2))
+                 ;; save-match-data: `otd--parse-comment-author' calls
+                 ;; `string-match' which clobbers the outer regex's match data
+                 ;; before `replace-match' uses it.
+                 (parsed (save-match-data
+                           (otd--parse-comment-author ctext-raw)))
+                 (use-author (or (car parsed) author))
+                 (done-parsed (save-match-data (otd--strip-done-prefix (cdr parsed))))
+                 (ctext (cdr done-parsed))
+                 (n     (1+ id)))
+            (when (car done-parsed) (push (number-to-string n) done-ids))
+            (replace-match
+             (stash (format "[%s]{.comment-start id=\"%d\" author=\"%s\" date=\"%s\"}%s[]{.comment-end id=\"%d\"}"
+                            ctext n use-author date range n))
+             t t))
+          (cl-incf n-cmt) (cl-incf n-hi))
+        ;; {~~old~>new~~} -> [old]{.deletion}[new]{.insertion}
+        (goto-char (point-min))
+        (while (re-search-forward "{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}" nil t)
+          (setq changed t)
+          (let ((old (match-string 1)) (new (match-string 2)))
+            (replace-match
+             (stash (format "[%s]{.deletion author=\"%s\" date=\"%s\"}[%s]{.insertion author=\"%s\" date=\"%s\"}"
+                            old author date new author date))
+             t t))
+          (cl-incf n-sub))
+        ;; {++text++} -> [text]{.insertion}
+        (goto-char (point-min))
+        (while (re-search-forward "{\\+\\+\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)\\+\\+}" nil t)
+          (setq changed t)
+          (let ((s (match-string 1)))
+            (replace-match
+             (stash (format "[%s]{.insertion author=\"%s\" date=\"%s\"}"
+                            s author date))
+             t t))
+          (cl-incf n-ins))
+        ;; {--text--} -> [text]{.deletion}
+        (goto-char (point-min))
+        (while (re-search-forward "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}" nil t)
+          (setq changed t)
+          (let ((s (match-string 1)))
+            (replace-match
+             (stash (format "[%s]{.deletion author=\"%s\" date=\"%s\"}"
+                            s author date))
+             t t))
+          (cl-incf n-del))
+        ;; Orphan {==range==} (no following comment): drop markers, keep text.
+        (goto-char (point-min))
+        (while (re-search-forward "{==\\([^{}]*?\\)==}" nil t)
+          (setq changed t)
+          (replace-match (stash (match-string 1)) t t)
+          (cl-incf n-hi))
+        ;; Orphan {>>comment<<}: zero-range comment so it still appears in Word.
+        (goto-char (point-min))
+        (while (re-search-forward "{>>\\([^<]*\\)<<}" nil t)
+          (setq changed t)
+          (let* ((ctext-raw (match-string 1))
+                 (parsed (save-match-data
+                           (otd--parse-comment-author ctext-raw)))
+                 (use-author (or (car parsed) author))
+                 (done-parsed (save-match-data (otd--strip-done-prefix (cdr parsed))))
+                 (ctext (cdr done-parsed))
+                 (n     (1+ id)))
+            (when (car done-parsed) (push (number-to-string n) done-ids))
+            (replace-match
+             (stash (format "[%s]{.comment-start id=\"%d\" author=\"%s\" date=\"%s\"}[]{.comment-end id=\"%d\"}"
+                            ctext n use-author date n))
+             t t))
+          (cl-incf n-cmt))))
     (list alist
           (list :ins n-ins :del n-del :sub n-sub :hi n-hi :cmt n-cmt)
           done-ids)))
