@@ -990,11 +990,77 @@ so the marker attaches without visibly changing the text)."
           nil t)
     (replace-match "" t t)))
 
+(defconst otd--image-ext-re
+  "\\.\\(?:png\\|jpe?g\\|gif\\|pdf\\|svg\\|emf\\|eps\\|tiff?\\|bmp\\|webp\\)\\'"
+  "Regexp (used with `case-fold-search') matching image/figure file
+extensions in an org link target.")
+
+(defun otd--url-scheme-p (path)
+  "Return non-nil if PATH begins with a URL scheme like `http:' (not a
+bare filesystem path)."
+  (string-match-p "\\`[A-Za-z][A-Za-z0-9+.-]*:" path))
+
+(defun otd--map-image-links (fn)
+  "Rewrite each org image-link target in the current buffer through FN.
+Handles both `[[TARGET]]' and `[[TARGET][DESC]]'.  FN receives the bare
+target path (a leading `file:' prefix stripped) and returns the new full
+target string (prefix included), or nil to leave the link unchanged.
+Only links whose target carries an image extension (see
+`otd--image-ext-re') are considered."
+  (goto-char (point-min))
+  (while (re-search-forward
+          "\\[\\[\\([^][\n]+\\)\\(\\(?:\\]\\[[^][\n]*\\)?\\)\\]\\]" nil t)
+    (let* ((raw  (match-string 1))           ; full target, e.g. "file:fig.png"
+           (rest (match-string 2))           ; "" or "][DESC"
+           ;; `string-match' clobbers the outer search's match data that
+           ;; `replace-match' below relies on; isolate it.  (`string-match-p'
+           ;; and the path functions in FN preserve match data.)
+           (path (save-match-data
+                   (if (string-match "\\`file:" raw)
+                       (substring raw (match-end 0)) raw)))
+           (case-fold-search t))
+      (when (string-match-p otd--image-ext-re path)
+        (let ((new (funcall fn path)))
+          (when (and new (not (string= new raw)))
+            (replace-match (concat "[[" new rest "]]") t t)))))))
+
+(defun otd--fileify-image-links ()
+  "Ensure every local (non-URL) image link in the current buffer carries a
+`file:' prefix.  Pandoc's org reader only emits an Image for a `file:'
+link (or an absolute path); a bare relative `[[fig-media/media/f1.png]]'
+is otherwise dropped as a `.spurious-link' text span and never embeds.
+The path itself is left unchanged (relative stays relative); the docx
+stage's `--resource-path' then resolves and embeds it.  Idempotent."
+  (otd--map-image-links
+   (lambda (path)
+     (unless (otd--url-scheme-p path)
+       (concat "file:" path)))))
+
+(defun otd--relativize-image-links (dir)
+  "Make absolute image-link targets under DIR relative to DIR, and give
+every local image link a `file:' prefix, so an imported org file stays
+portable across machines (the docx importer's `--extract-media' writes
+machine-specific absolute paths) and still re-exports as an embedded
+image.  Targets outside DIR and URLs are left untouched."
+  (setq dir (file-name-as-directory (expand-file-name dir)))
+  (otd--map-image-links
+   (lambda (path)
+     (cond
+      ((otd--url-scheme-p path) nil)
+      ((file-name-absolute-p path)
+       (let ((abs (expand-file-name path)))
+         (when (string-prefix-p dir abs)
+           (concat "file:" (file-relative-name abs dir)))))
+      (t (concat "file:" path))))))
+
 (defun otd--postfix-org (org-file)
-  "Apply `otd--postfix-fixups' to ORG-FILE on disk."
+  "Apply `otd--postfix-fixups' to ORG-FILE on disk and relativize its
+image links (see `otd--relativize-image-links') so the imported file is
+portable."
   (with-temp-buffer
     (insert-file-contents org-file)
     (otd--postfix-fixups)
+    (otd--relativize-image-links (file-name-directory (expand-file-name org-file)))
     (write-region (point-min) (point-max) org-file nil 'silent)))
 
 ;;;###autoload
@@ -2597,6 +2663,11 @@ Author defaults to `otd-export-author'."
             ;; pandoc actually needs.  See `otd--expand-author-block'.
             (otd--expand-author-block)
             (otd--postfix-fixups)
+            ;; Give bare relative image links a `file:' prefix so pandoc's org
+            ;; reader emits them as Images (a bare relative link is otherwise
+            ;; dropped as a spurious link).  The path stays relative; the
+            ;; md->docx stage's `--resource-path=dir' resolves and embeds it.
+            (otd--fileify-image-links)
             (let ((res (otd--mark-criticmarkup)))
               (setq alist    (nth 0 res)
                     counts   (nth 1 res)
