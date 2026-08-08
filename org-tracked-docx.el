@@ -2936,6 +2936,59 @@ what is now an unnested outer token, however deep the original nesting."
         (replace-match (cdr pair) t t)))
     (write-region (point-min) (point-max) md-file nil 'silent)))
 
+;;;; --- auto-import on find-file ---------------------------------------
+
+(defcustom otd-auto-import-reuse t
+  "When non-nil, `otd-auto-import-mode' reuses an existing import.
+If the `otd-output-suffix' .org that `otd-import' produces for a docx
+already exists and is at least as new as the docx, opening the docx
+visits that .org instead of re-running pandoc -- which would overwrite
+any edits made in the imported file.  When the docx is newer than the
+existing .org (a freshly returned review), it is re-imported."
+  :type 'boolean :group 'org-tracked-docx)
+
+(defun otd--auto-import-target (docx)
+  "Return the .org path `otd-import' writes for DOCX (no conversion)."
+  (let ((dir  (file-name-directory (expand-file-name docx)))
+        (base (file-name-sans-extension (file-name-nondirectory docx))))
+    (expand-file-name (concat base otd-output-suffix ".org") dir)))
+
+(defun otd--auto-import-noselect (orig filename &rest args)
+  "Around-advice for `find-file-noselect': import docx via `otd-import'.
+When FILENAME is an existing `*.docx', convert it and return the buffer
+visiting the imported .org instead of a buffer of raw docx bytes.  Any
+error falls back to ORIG so the file still opens."
+  (let ((file (and (stringp filename) (expand-file-name filename))))
+    (if (and file
+             (string-match-p "\\.docx\\'" file)
+             (file-regular-p file))
+        (condition-case err
+            (let* ((out   (otd--auto-import-target file))
+                   (reuse (and otd-auto-import-reuse
+                               (file-exists-p out)
+                               (not (file-newer-than-file-p file out)))))
+              ;; `otd-import' already visits OUT; calling ORIG on it just
+              ;; returns that live buffer.  In the reuse branch ORIG opens
+              ;; the previously imported .org directly.
+              (apply orig (if reuse out (otd-import file)) args))
+          (error
+           (message "otd auto-import failed (%s); opening docx raw"
+                    (error-message-string err))
+           (apply orig filename args)))
+      (apply orig filename args))))
+
+;;;###autoload
+(define-minor-mode otd-auto-import-mode
+  "Global minor mode: opening a Word .docx auto-imports it with `otd-import'.
+When enabled, visiting any `*.docx' file (via \\[find-file], dired, a
+desktop restore, etc.) runs the tracked-changes import pipeline and
+shows the resulting CriticMarkup org buffer instead of raw binary.
+See `otd-auto-import-reuse' for re-import vs. reuse behaviour."
+  :global t :group 'org-tracked-docx
+  (if otd-auto-import-mode
+      (advice-add 'find-file-noselect :around #'otd--auto-import-noselect)
+    (advice-remove 'find-file-noselect #'otd--auto-import-noselect)))
+
 (provide 'org-tracked-docx)
 
 ;; Load the JSON-AST import backend (the default for `otd-import') when it
