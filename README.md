@@ -15,6 +15,7 @@ accept/reject and merge against the canonical org source.
 | File | Role |
 |------|------|
 | `org-tracked-docx.el` | Main package: `otd-import`, `otd-export`, accept/reject/merge, `otd-criticmarkup-mode`. |
+| `org-tracked-docx-json.el` | Default import backend: `otd-import-json`, a structured walk over pandoc's JSON AST (loaded automatically; see **Import backend** below). |
 | `org-tracked-docx-zotero.el` | Optional Zotero layer: shields Zotero (Google-Docs) citation fields across the pandoc round-trip. |
 | `otd_zotero_shield.py` | Helper invoked by the Zotero layer to shield/unshield Zotero HYPERLINK fields in the `.docx`. |
 | `otd-zotero-unshield.lua` | Pandoc Lua filter that restores shielded Zotero fields on export. |
@@ -53,6 +54,28 @@ If the matching `…-tracked.org` already exists and is at least as new as the
 docx, the existing import is reused rather than re-run (so your edits aren't
 clobbered); a newer docx is re-imported. Toggle this with
 `otd-auto-import-reuse`. If pandoc fails, the docx opens normally.
+
+## Import backend
+
+`otd-import` has two backends, selected by `otd-import-backend`:
+
+- **`json`** (default) — `otd-import-json`. Converts `docx → pandoc JSON AST`,
+  replaces tracked-change spans with CriticMarkup *inside the AST* via a generic
+  structural walk, then renders `json → org`. No markdown intermediate and no
+  textual span-matching, so it preserves reviewer comments containing brackets,
+  URLs and citations that the markdown backend can silently drop, and emits no
+  pandoc escaping artifacts (`\'`, `\"`, `[text](url)`). Tables and footnotes are
+  walked with no per-type code.
+- **`markdown`** — the original `otd--import-markdown`: `docx → markdown`, regex
+  span rewriting, `markdown → org`. Kept as a fallback.
+
+`org-tracked-docx-json.el` is loaded automatically when it sits alongside
+`org-tracked-docx.el`. If it is absent, `otd-import` falls back to the markdown
+backend regardless of `otd-import-backend`.
+
+`M-x otd-import-compare RET reviewed.docx RET` imports with both backends and
+`ediff`s the two outputs — handy for spot-checking the difference on your own
+files.
 
 ## Notes
 

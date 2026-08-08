@@ -89,6 +89,26 @@ When nil or no embedded source is present, the lossy pandoc roundtrip
 is used as-is."
   :type 'boolean :group 'org-tracked-docx)
 
+(defcustom otd-import-backend 'json
+  "Import pipeline used by `otd-import'.
+
+`json' (default) is `otd-import-json': a structured walk over pandoc's
+JSON AST that replaces tracked-change spans with CriticMarkup inside the
+tree, then renders json->org.  It has no markdown intermediate and no
+textual span-matching, so it preserves comments containing brackets,
+URLs and citations that the `markdown' backend can silently drop, and it
+emits no pandoc escaping artifacts.
+
+`markdown' is the original `otd--import-markdown': docx->markdown, regex
+span rewriting, markdown->org.  Kept as a fallback.
+
+The JSON backend lives in the optional `org-tracked-docx-json' feature;
+if it is not loaded, `otd-import' uses the markdown backend regardless
+of this setting."
+  :type '(choice (const :tag "JSON AST (robust, default)" json)
+                 (const :tag "Markdown (legacy)" markdown))
+  :group 'org-tracked-docx)
+
 (defcustom otd-fix-table-borders t
   "When non-nil, `otd-export' rewrites every table's borders directly
 \(top + bottom rule, plus a rule under the header row; no vertical or
@@ -193,6 +213,26 @@ machine."
 
 ;;;###autoload
 (defun otd-import (docx &optional output)
+  "Import DOCX to CriticMarkup org, dispatching on `otd-import-backend'.
+
+The default `json' backend (`otd-import-json') is more robust than the
+original `markdown' backend (`otd--import-markdown'): it preserves
+comments containing brackets, URLs and citations that the markdown path
+can silently drop, and emits no pandoc escaping artifacts.  When the
+JSON module is not loaded, falls back to the markdown backend.
+
+With prefix arg, prompt for OUTPUT path; otherwise the output is placed
+alongside DOCX with `otd-output-suffix' appended."
+  (interactive
+   (list (read-file-name "Docx file: " nil nil t nil
+                         (lambda (f) (or (file-directory-p f)
+                                         (string-match-p "\\.docx\\'" f))))
+         (when current-prefix-arg (read-file-name "Output .org: "))))
+  (if (and (eq otd-import-backend 'json) (fboundp 'otd-import-json))
+      (otd-import-json docx output)
+    (otd--import-markdown docx output)))
+
+(defun otd--import-markdown (docx &optional output)
   "Convert DOCX to org-mode preserving tracked changes AND comments as CriticMarkup.
 With prefix arg, prompt for OUTPUT path; otherwise the output is placed
 alongside DOCX with `otd-output-suffix' appended.  After conversion the
@@ -2897,4 +2937,19 @@ what is now an unnested outer token, however deep the original nesting."
     (write-region (point-min) (point-max) md-file nil 'silent)))
 
 (provide 'org-tracked-docx)
+
+;; Load the JSON-AST import backend (the default for `otd-import') when it
+;; sits alongside this file.  Soft by design: if it is absent or fails to
+;; load, `otd-import' transparently falls back to the markdown backend.
+;; This runs after `provide' above, so the backend's own
+;; `(require 'org-tracked-docx)' is already satisfied (no load cycle).
+(condition-case nil
+    (let* ((here (or load-file-name buffer-file-name))
+           (sib  (and here (expand-file-name "org-tracked-docx-json"
+                                             (file-name-directory here)))))
+      (when (and sib (or (file-exists-p (concat sib ".elc"))
+                         (file-exists-p (concat sib ".el"))))
+        (load sib nil t)))
+  (error nil))
+
 ;;; org-tracked-docx.el ends here
