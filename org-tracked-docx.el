@@ -2805,6 +2805,26 @@ exports to Word as an actually-resolved comment (see
       (cons t (substring ctext (match-end 0)))
     (cons nil ctext)))
 
+(defun otd--orgcite->pandoc (text)
+  "Convert Org citation syntax in TEXT to pandoc markdown citations.
+Citations inside CriticMarkup spans bypass the `org -> markdown' stage of
+`otd-export' (they sit inside opaque placeholders while pandoc reads the
+org), so their `[cite:@key]' would otherwise reach the final `markdown ->
+docx' stage still in Org syntax -- which pandoc's *markdown* reader does
+not recognise as a citation, shipping it as literal text that citeproc
+never resolves.  Rewriting to pandoc form here lets a citation inside a
+tracked change or comment render like any other.  `[cite:@key]' /
+`[cite:@a;@b]' -> `[@key]' / `[@a;@b]' (parenthetical); `[cite/t:@key]'
+-> `@key' (narrative single key)."
+  (let ((s text))
+    (setq s (replace-regexp-in-string
+             "\\[cite/\\(?:t\\|text\\):[ \t]*@\\([^]@;[:space:]]+\\)\\]"
+             "@\\1" s t))
+    (setq s (replace-regexp-in-string
+             "\\[cite\\(?:/[a-z]+\\)?:[ \t]*\\([^][]*?\\)\\]"
+             "[\\1]" s t))
+    s))
+
 (defun otd--mark-criticmarkup ()
   "Replace CriticMarkup tokens in current buffer with sentinel placeholders.
 Return (ALIST COUNTS DONE-IDS) where ALIST maps each placeholder string
@@ -2852,7 +2872,7 @@ what is now an unnested outer token, however deep the original nesting."
         (goto-char (point-min))
         (while (re-search-forward "{==\\([^{}]*?\\)==}{>>\\([^<]*\\)<<}" nil t)
           (setq changed t)
-          (let* ((range (match-string 1))
+          (let* ((range (save-match-data (otd--orgcite->pandoc (match-string 1))))
                  (ctext-raw (match-string 2))
                  ;; save-match-data: `otd--parse-comment-author' calls
                  ;; `string-match' which clobbers the outer regex's match data
@@ -2861,7 +2881,7 @@ what is now an unnested outer token, however deep the original nesting."
                            (otd--parse-comment-author ctext-raw)))
                  (use-author (or (car parsed) author))
                  (done-parsed (save-match-data (otd--strip-done-prefix (cdr parsed))))
-                 (ctext (cdr done-parsed))
+                 (ctext (save-match-data (otd--orgcite->pandoc (cdr done-parsed))))
                  (n     (1+ id)))
             (when (car done-parsed) (push (number-to-string n) done-ids))
             (replace-match
@@ -2873,7 +2893,7 @@ what is now an unnested outer token, however deep the original nesting."
         (goto-char (point-min))
         (while (re-search-forward "{~~\\([^~{}]*?\\)~>\\([^~{}]*?\\)~~}" nil t)
           (setq changed t)
-          (let ((old (match-string 1)) (new (match-string 2)))
+          (let ((old (save-match-data (otd--orgcite->pandoc (match-string 1)))) (new (save-match-data (otd--orgcite->pandoc (match-string 2)))))
             (replace-match
              (stash (format "[%s]{.deletion author=\"%s\" date=\"%s\"}[%s]{.insertion author=\"%s\" date=\"%s\"}"
                             old author date new author date))
@@ -2883,7 +2903,7 @@ what is now an unnested outer token, however deep the original nesting."
         (goto-char (point-min))
         (while (re-search-forward "{\\+\\+\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)\\+\\+}" nil t)
           (setq changed t)
-          (let ((s (match-string 1)))
+          (let ((s (save-match-data (otd--orgcite->pandoc (match-string 1)))))
             (replace-match
              (stash (format "[%s]{.insertion author=\"%s\" date=\"%s\"}"
                             s author date))
@@ -2893,7 +2913,7 @@ what is now an unnested outer token, however deep the original nesting."
         (goto-char (point-min))
         (while (re-search-forward "{--\\(?:\\[[^]]+\\]\\)?\\([^{}]*?\\)--}" nil t)
           (setq changed t)
-          (let ((s (match-string 1)))
+          (let ((s (save-match-data (otd--orgcite->pandoc (match-string 1)))))
             (replace-match
              (stash (format "[%s]{.deletion author=\"%s\" date=\"%s\"}"
                             s author date))
@@ -2903,7 +2923,7 @@ what is now an unnested outer token, however deep the original nesting."
         (goto-char (point-min))
         (while (re-search-forward "{==\\([^{}]*?\\)==}" nil t)
           (setq changed t)
-          (replace-match (stash (match-string 1)) t t)
+          (replace-match (stash (save-match-data (otd--orgcite->pandoc (match-string 1)))) t t)
           (cl-incf n-hi))
         ;; Orphan {>>comment<<}: zero-range comment so it still appears in Word.
         (goto-char (point-min))
@@ -2914,7 +2934,7 @@ what is now an unnested outer token, however deep the original nesting."
                            (otd--parse-comment-author ctext-raw)))
                  (use-author (or (car parsed) author))
                  (done-parsed (save-match-data (otd--strip-done-prefix (cdr parsed))))
-                 (ctext (cdr done-parsed))
+                 (ctext (save-match-data (otd--orgcite->pandoc (cdr done-parsed))))
                  (n     (1+ id)))
             (when (car done-parsed) (push (number-to-string n) done-ids))
             (replace-match
